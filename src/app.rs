@@ -48,13 +48,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Scanning is synchronous — blocks the UI thread during scan
         // Global blue selection highlight
         ctx.style_mut(|style| {
             style.visuals.selection.bg_fill = egui::Color32::from_rgb(56, 132, 244);
         });
 
-        // Scanning is synchronous — blocks the UI thread during scan
+        // Scanning is synchronous — blocks the UI thread
         if let AppState::Scanning {
             ref path,
             start_time,
@@ -100,38 +99,27 @@ impl eframe::App for App {
                 });
             }
             AppState::Loaded(loaded) => {
-                let LoadedState {
-                    tree,
-                    color_map,
-                    selected,
-                    scan_time_ms,
-                    cached_layout_size,
-                    treemap_texture,
-                } = loaded.as_mut();
+                handle_delete(loaded, ctx);
 
-                handle_delete(
-                    ctx,
-                    tree,
-                    color_map,
-                    selected,
-                    cached_layout_size,
-                    treemap_texture,
-                );
+                let loaded = loaded.as_mut();
 
                 // Status bar with selection info + action buttons
                 egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} Files", format_file_count(tree.root.file_count)));
+                        ui.label(format!(
+                            "{} Files",
+                            format_file_count(loaded.tree.root.file_count)
+                        ));
                         ui.separator();
                         ui.label(format!(
                             "{} Scanned in {:.0}ms",
-                            format_size(tree.root.size),
-                            scan_time_ms,
+                            format_size(loaded.tree.root.size),
+                            loaded.scan_time_ms,
                         ));
 
                         // Right side: action buttons
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let has_selection = selected.is_some();
+                            let has_selection = loaded.selected.is_some();
 
                             // Move to Trash button (red-tinted)
                             let trash_text =
@@ -143,31 +131,18 @@ impl eframe::App for App {
                             let trash_btn =
                                 ui.add_enabled(has_selection, egui::Button::new(trash_text));
                             if trash_btn.clicked()
-                                && let Some(sel_path) = selected.as_ref()
-                                && let Some(fs_path) = tree.build_fs_path(sel_path)
-                                && let Some(node) = resolve_selected(&tree.root, sel_path)
+                                && let Some(target) = loaded
+                                    .selected
+                                    .as_ref()
+                                    .and_then(|sp| DeleteTarget::from_selection(&loaded.tree, sp))
+                                && native_confirm_delete(
+                                    target.name(),
+                                    target.size,
+                                    &target.fs_path,
+                                    target.is_dir,
+                                )
                             {
-                                let name = node.name.clone();
-                                let size = node.size;
-                                let is_dir = node.is_dir;
-                                let file_count = node.file_count;
-                                let dir_count = node.dir_count;
-                                let sel = sel_path.clone();
-                                if native_confirm_delete(&name, size, &fs_path, is_dir) {
-                                    execute_delete(
-                                        tree,
-                                        color_map,
-                                        selected,
-                                        &sel,
-                                        &fs_path,
-                                        is_dir,
-                                        size,
-                                        file_count,
-                                        dir_count,
-                                        cached_layout_size,
-                                        treemap_texture,
-                                    );
-                                }
+                                execute_delete(loaded, &target);
                             }
 
                             // Reveal in Finder button
@@ -176,8 +151,8 @@ impl eframe::App for App {
                                 egui::Button::new("\u{1F50D} Reveal in Finder"),
                             );
                             if reveal_btn.clicked()
-                                && let Some(sel_path) = selected.as_ref()
-                                && let Some(fs_path) = tree.build_fs_path(sel_path)
+                                && let Some(sel_path) = loaded.selected.as_ref()
+                                && let Some(fs_path) = loaded.tree.build_fs_path(sel_path)
                             {
                                 reveal_in_finder(&fs_path);
                             }
@@ -194,7 +169,7 @@ impl eframe::App for App {
                             .inner_margin(egui::Margin::from(8)),
                     )
                     .show(ctx, |ui| {
-                        ui::tree_view::show(ui, &tree.root, selected, color_map);
+                        ui::tree_view::show(ui, &loaded.tree.root, &mut loaded.selected);
                     });
 
                 // Central panel: breadcrumb + treemap
@@ -202,7 +177,8 @@ impl eframe::App for App {
                     // Breadcrumb path bar (above treemap only)
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 2.0;
-                        let segments: Vec<&str> = tree
+                        let segments: Vec<&str> = loaded
+                            .tree
                             .root_path
                             .split('/')
                             .filter(|s| !s.is_empty())
@@ -238,11 +214,11 @@ impl eframe::App for App {
 
                     ui::treemap_view::show(
                         ui,
-                        tree,
-                        selected,
-                        color_map,
-                        cached_layout_size,
-                        treemap_texture,
+                        &mut loaded.tree,
+                        &mut loaded.selected,
+                        &loaded.color_map,
+                        &mut loaded.cached_layout_size,
+                        &mut loaded.treemap_texture,
                     );
                 });
             }
@@ -250,18 +226,44 @@ impl eframe::App for App {
     }
 }
 
+/// Snapshot of a node's metadata needed for deletion.
+struct DeleteTarget {
+    sel_path: TreePath,
+    fs_path: std::path::PathBuf,
+    is_dir: bool,
+    size: u64,
+    file_count: u64,
+    dir_count: u64,
+}
+
+impl DeleteTarget {
+    /// Resolve the selected node into a DeleteTarget, or None if the path is invalid.
+    fn from_selection(tree: &FileTree, sel_path: &[usize]) -> Option<Self> {
+        let fs_path = tree.build_fs_path(sel_path)?;
+        let node = resolve_selected(&tree.root, sel_path)?;
+        Some(Self {
+            sel_path: sel_path.to_vec(),
+            fs_path,
+            is_dir: node.is_dir,
+            size: node.size,
+            file_count: node.file_count,
+            dir_count: node.dir_count,
+        })
+    }
+
+    fn name(&self) -> &str {
+        self.fs_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+    }
+}
+
 /// Handle Delete/Backspace when something is selected.
 /// ⌘Delete: delete immediately (no confirmation).
 /// Delete alone: show native confirmation dialog.
-fn handle_delete(
-    ctx: &egui::Context,
-    tree: &mut FileTree,
-    color_map: &mut ColorMap,
-    selected: &mut Option<TreePath>,
-    cached_layout_size: &mut Option<(f32, f32)>,
-    treemap_texture: &mut Option<egui::TextureHandle>,
-) {
-    let Some(sel_path) = selected.as_ref() else {
+fn handle_delete(loaded: &mut LoadedState, ctx: &egui::Context) {
+    let Some(sel_path) = loaded.selected.as_ref() else {
         return;
     };
     let (cmd_delete, bare_delete) = ctx.input(|i| {
@@ -272,70 +274,40 @@ fn handle_delete(
     if !(cmd_delete || bare_delete) {
         return;
     }
-    let (Some(fs_path), Some(node)) = (
-        tree.build_fs_path(sel_path),
-        resolve_selected(&tree.root, sel_path),
-    ) else {
+    let Some(target) = DeleteTarget::from_selection(&loaded.tree, sel_path) else {
         return;
     };
-
-    let name = node.name.clone();
-    let size = node.size;
-    let is_dir = node.is_dir;
-    let file_count = node.file_count;
-    let dir_count = node.dir_count;
-    let sel_path = sel_path.clone();
-
-    if !cmd_delete && !native_confirm_delete(&name, size, &fs_path, is_dir) {
+    if !cmd_delete
+        && !native_confirm_delete(target.name(), target.size, &target.fs_path, target.is_dir)
+    {
         return;
     }
-
-    execute_delete(
-        tree,
-        color_map,
-        selected,
-        &sel_path,
-        &fs_path,
-        is_dir,
-        size,
-        file_count,
-        dir_count,
-        cached_layout_size,
-        treemap_texture,
-    );
+    execute_delete(loaded, &target);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_delete(
-    tree: &mut FileTree,
-    color_map: &mut ColorMap,
-    selected: &mut Option<TreePath>,
-    sel_path: &[usize],
-    fs_path: &std::path::Path,
-    is_dir: bool,
-    size: u64,
-    file_count: u64,
-    dir_count: u64,
-    cached_layout_size: &mut Option<(f32, f32)>,
-    treemap_texture: &mut Option<egui::TextureHandle>,
-) {
-    let result = if is_dir {
-        std::fs::remove_dir_all(fs_path)
+fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
+    let result = if target.is_dir {
+        std::fs::remove_dir_all(&target.fs_path)
     } else {
-        std::fs::remove_file(fs_path)
+        std::fs::remove_file(&target.fs_path)
     };
     match result {
         Ok(()) => {
-            tree.subtract_from_ancestors(sel_path, size, file_count, dir_count);
-            tree.remove_at_path(sel_path);
-            tree.rebuild_extensions();
-            *color_map = ColorMap::from_extensions(&tree.extensions);
-            *selected = next_selection_after_delete(&tree.root, sel_path);
-            *cached_layout_size = None;
-            *treemap_texture = None;
+            loaded.tree.subtract_from_ancestors(
+                &target.sel_path,
+                target.size,
+                target.file_count,
+                target.dir_count,
+            );
+            loaded.tree.remove_at_path(&target.sel_path);
+            loaded.tree.rebuild_extensions();
+            loaded.color_map = ColorMap::from_extensions(&loaded.tree.extensions);
+            loaded.selected = next_selection_after_delete(&loaded.tree.root, &target.sel_path);
+            loaded.cached_layout_size = None;
+            loaded.treemap_texture = None;
         }
         Err(e) => {
-            eprintln!("Failed to delete {:?}: {}", fs_path, e);
+            eprintln!("Failed to delete {:?}: {}", target.fs_path, e);
         }
     }
 }

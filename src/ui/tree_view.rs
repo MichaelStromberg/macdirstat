@@ -29,12 +29,7 @@ pub fn show_branding(ui: &mut egui::Ui) {
     });
 }
 
-pub fn show(
-    ui: &mut egui::Ui,
-    root: &FileNode,
-    selected: &mut Option<TreePath>,
-    _color_map: &crate::model::color::ColorMap,
-) {
+pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>) {
     show_branding(ui);
     ui.add_space(4.0);
 
@@ -63,18 +58,17 @@ pub fn show(
         .inner_margin(4.0);
 
     // Derive alternating row color from the frame's fill
-    let panel_fill = frame_fill;
     let alt_row_color = if ui.visuals().dark_mode {
         Color32::from_rgb(
-            panel_fill.r().saturating_add(8),
-            panel_fill.g().saturating_add(8),
-            panel_fill.b().saturating_add(8),
+            frame_fill.r().saturating_add(8),
+            frame_fill.g().saturating_add(8),
+            frame_fill.b().saturating_add(8),
         )
     } else {
         Color32::from_rgb(
-            panel_fill.r().saturating_sub(10),
-            panel_fill.g().saturating_sub(10),
-            panel_fill.b().saturating_sub(10),
+            frame_fill.r().saturating_sub(10),
+            frame_fill.g().saturating_sub(10),
+            frame_fill.b().saturating_sub(10),
         )
     };
 
@@ -84,7 +78,7 @@ pub fn show(
         rendered: 0,
         visible_paths: Vec::new(),
         row_index: 0,
-        panel_fill,
+        panel_fill: frame_fill,
         alt_row_color,
         scroll_right: 0.0,
         frame_left: 0.0,
@@ -190,13 +184,12 @@ impl<'a> TreeCtx<'a> {
         } else {
             Color32::from_rgb(140, 140, 140)
         };
-        let font = egui::FontId::proportional(11.0);
         let anchor = pos2(self.scroll_right - SIZE_COL_MARGIN, y_center);
         ui.painter().text(
             anchor,
             egui::Align2::RIGHT_CENTER,
             &size_str,
-            font.clone(),
+            egui::FontId::proportional(11.0),
             color,
         );
         if is_selected {
@@ -204,7 +197,7 @@ impl<'a> TreeCtx<'a> {
                 anchor + vec2(0.5, 0.0),
                 egui::Align2::RIGHT_CENTER,
                 &size_str,
-                font,
+                egui::FontId::proportional(11.0),
                 color,
             );
         }
@@ -219,35 +212,38 @@ impl<'a> TreeCtx<'a> {
         } else {
             ui.visuals().text_color()
         };
-        let font = egui::FontId::proportional(14.0);
 
         let size_area_left = self.scroll_right - SIZE_COL_MARGIN - SIZE_COL_WIDTH;
         let fade_left = size_area_left - FADE_WIDTH;
-
         let clip = ui.clip_rect();
+        let bold_offset = vec2(0.5, 0.0);
+
+        // Helper: paint text (with optional bold double-draw) using given painter and color
+        let draw = |painter: &egui::Painter, color: Color32| {
+            painter.text(
+                pos,
+                egui::Align2::LEFT_CENTER,
+                name,
+                egui::FontId::proportional(14.0),
+                color,
+            );
+            if is_selected {
+                painter.text(
+                    pos + bold_offset,
+                    egui::Align2::LEFT_CENTER,
+                    name,
+                    egui::FontId::proportional(14.0),
+                    color,
+                );
+            }
+        };
 
         // Full-opacity region: from left edge to start of fade
         let full_clip = Rect::from_min_max(
             pos2(clip.left(), clip.top()),
             pos2(fade_left, clip.bottom()),
         );
-        let full_painter = ui.painter().with_clip_rect(full_clip);
-        full_painter.text(
-            pos,
-            egui::Align2::LEFT_CENTER,
-            name,
-            font.clone(),
-            base_color,
-        );
-        if is_selected {
-            full_painter.text(
-                pos + vec2(0.5, 0.0),
-                egui::Align2::LEFT_CENTER,
-                name,
-                font.clone(),
-                base_color,
-            );
-        }
+        draw(&ui.painter().with_clip_rect(full_clip), base_color);
 
         // Fade region: multiple strips with decreasing alpha
         let steps: u32 = 8;
@@ -261,23 +257,12 @@ impl<'a> TreeCtx<'a> {
                 base_color.b(),
                 alpha,
             );
-
             let strip_left = fade_left + i as f32 * step_w;
             let strip_clip = Rect::from_min_max(
                 pos2(strip_left, clip.top()),
                 pos2(strip_left + step_w, clip.bottom()),
             );
-            let strip_painter = ui.painter().with_clip_rect(strip_clip);
-            strip_painter.text(pos, egui::Align2::LEFT_CENTER, name, font.clone(), faded);
-            if is_selected {
-                strip_painter.text(
-                    pos + vec2(0.5, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    name,
-                    font.clone(),
-                    faded,
-                );
-            }
+            draw(&ui.painter().with_clip_rect(strip_clip), faded);
         }
     }
 
