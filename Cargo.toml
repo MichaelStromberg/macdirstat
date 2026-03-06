@@ -2,6 +2,8 @@
 name = "macdirstat"
 version = "0.1.0"
 edition = "2024"
+description = "fast windirstat clone for macos"
+license = "GPL-3.0"
 default-run = "macdirstat"
 
 [dependencies]
