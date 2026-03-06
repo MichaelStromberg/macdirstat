@@ -1,40 +1,15 @@
 [package]
 name = "macdirstat"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "fast windirstat clone for macos"
 license = "GPL-3.0"
-default-run = "macdirstat"
 
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
-egui_extras = "0.31"
-jwalk = "0.8"
-walkdir = "2"
-ignore = "0.4"
 libc = "0.2"
 rayon = "1"
+rfd = "0.15"
 treemap = "0.3"
 
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-rand = "0.9"
-
-[[bench]]
-name = "scan_methods"
-harness = false
-
-[[bench]]
-name = "treemap_layout"
-harness = false
-
-[[bench]]
-name = "egui_render"
-harness = false
-
-[[bin]]
-name = "investigate"
-
-[[bin]]
-name = "bench_tree"

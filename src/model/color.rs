@@ -134,26 +134,20 @@ const fn normalize_color(r: u8, g: u8, b: u8, target: f64) -> (u8, u8, u8) {
 
 const DIR_COLOR: Color32 = Color32::from_rgb(100, 100, 100);
 
-/// Maps extensions to colors. Stores both text-readable and treemap-normalized palettes.
+/// Maps extensions to colors. Stores paired (text, treemap) colors in a single map.
 pub struct ColorMap {
-    map_text: std::collections::HashMap<Box<str>, Color32>,
-    map_treemap: std::collections::HashMap<Box<str>, Color32>,
+    map: std::collections::HashMap<Box<str>, (Color32, Color32)>,
 }
 
 impl ColorMap {
     /// Build a color map from sorted extensions (largest first).
     pub fn from_extensions(extensions: &[(Box<str>, u64)]) -> Self {
-        let mut map_text = std::collections::HashMap::new();
-        let mut map_treemap = std::collections::HashMap::new();
+        let mut map = std::collections::HashMap::new();
         for (i, (ext, _)) in extensions.iter().enumerate() {
             let idx = i % PALETTE_TEXT.len();
-            map_text.insert(ext.clone(), PALETTE_TEXT[idx]);
-            map_treemap.insert(ext.clone(), PALETTE_TREEMAP[idx]);
+            map.insert(ext.clone(), (PALETTE_TEXT[idx], PALETTE_TREEMAP[idx]));
         }
-        Self {
-            map_text,
-            map_treemap,
-        }
+        Self { map }
     }
 
     /// Get readable text color for an extension (raw palette, good contrast on light backgrounds).
@@ -161,9 +155,9 @@ impl ColorMap {
         if extension.is_empty() {
             return DIR_COLOR;
         }
-        self.map_text
+        self.map
             .get(extension)
-            .copied()
+            .map(|&(text, _)| text)
             .unwrap_or(PALETTE_TEXT[PALETTE_TEXT.len() - 1])
     }
 
@@ -172,9 +166,9 @@ impl ColorMap {
         if extension.is_empty() {
             return DIR_COLOR;
         }
-        self.map_treemap
+        self.map
             .get(extension)
-            .copied()
+            .map(|&(_, treemap)| treemap)
             .unwrap_or(PALETTE_TREEMAP[PALETTE_TREEMAP.len() - 1])
     }
 

@@ -9,8 +9,6 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-use super::jwalk_scan::ScanResult;
-
 const SCAN_BUF_SIZE: usize = 256 * 1024; // 256KB — fewer syscalls for large dirs
 
 thread_local! {
@@ -33,14 +31,14 @@ const ATTR_FILE_TOTALSIZE: libc::attrgroup_t = 0x0000_0002;
 const VDIR: u32 = 2; // directory
 
 /// A directory entry with name, type, and size.
-pub struct DirEntry {
+pub(crate) struct DirEntry {
     pub name: Box<str>,
     pub is_dir: bool,
     pub file_size: u64,
 }
 
 /// Open a directory and return its fd, or -1 on error.
-pub fn open_dir(dir_path: &Path) -> libc::c_int {
+pub(crate) fn open_dir(dir_path: &Path) -> libc::c_int {
     let c_path = match CString::new(dir_path.as_os_str().as_bytes()) {
         Ok(p) => p,
         Err(_) => return -1,
@@ -50,7 +48,7 @@ pub fn open_dir(dir_path: &Path) -> libc::c_int {
 
 /// Open a subdirectory relative to a parent fd.
 /// Uses stack buffer for short names to avoid heap allocation.
-pub fn openat_dir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
+pub(crate) fn openat_dir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
     let bytes = name.as_bytes();
     if bytes.contains(&0) {
         return -1;
@@ -83,14 +81,14 @@ pub fn openat_dir(parent_fd: libc::c_int, name: &str) -> libc::c_int {
 }
 
 /// Close a directory fd.
-pub fn close_dir(fd: libc::c_int) {
+pub(crate) fn close_dir(fd: libc::c_int) {
     if fd >= 0 {
         unsafe { libc::close(fd) };
     }
 }
 
 /// Scan using an already-opened fd. Returns entries without closing the fd.
-pub fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
+pub(crate) fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
     if fd < 0 {
         return Vec::new();
     }
@@ -124,17 +122,6 @@ pub fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
         }
     }); // end SCAN_BUFFER.with
 
-    results
-}
-
-/// Scan a single directory using getattrlistbulk.
-fn scan_dir(dir_path: &Path) -> Vec<DirEntry> {
-    let fd = open_dir(dir_path);
-    if fd < 0 {
-        return Vec::new();
-    }
-    let results = scan_dir_entries_fd(fd);
-    close_dir(fd);
     results
 }
 
@@ -189,7 +176,14 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             continue;
         }
         let name_data_offset = read_i32(buffer, name_ref_pos);
-        let name_abs = (name_ref_pos as i32 + name_data_offset) as usize;
+        // Safe cast: check for overflow before converting to usize
+        let Some(name_abs) = (name_ref_pos as i32)
+            .checked_add(name_data_offset)
+            .and_then(|v| usize::try_from(v).ok())
+        else {
+            offset += entry_length;
+            continue;
+        };
 
         let name: Box<str> = if name_abs < entry_start + entry_length {
             let slice = &buffer[name_abs..entry_start + entry_length];
@@ -218,86 +212,4 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
         });
         offset += entry_length;
     }
-}
-
-/// Full recursive scan using getattrlistbulk.
-pub fn scan(root: &Path) -> ScanResult {
-    let mut total_size: u64 = 0;
-    let mut file_count: u64 = 0;
-    let mut dir_count: u64 = 0;
-
-    scan_recursive(root, &mut total_size, &mut file_count, &mut dir_count);
-
-    ScanResult {
-        total_size,
-        file_count,
-        dir_count,
-    }
-}
-
-fn scan_recursive(dir: &Path, total_size: &mut u64, file_count: &mut u64, dir_count: &mut u64) {
-    let entries = scan_dir(dir);
-
-    for entry in &entries {
-        if entry.is_dir {
-            *dir_count += 1;
-            let child_path = dir.join(&*entry.name);
-            scan_recursive(&child_path, total_size, file_count, dir_count);
-        } else {
-            *total_size += entry.file_size;
-            *file_count += 1;
-        }
-    }
-}
-
-/// Parallel recursive scan using getattrlistbulk + rayon.
-pub fn scan_parallel(root: &Path) -> ScanResult {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    let total_size = AtomicU64::new(0);
-    let file_count = AtomicU64::new(0);
-    let dir_count = AtomicU64::new(0);
-
-    scan_parallel_recursive(root, &total_size, &file_count, &dir_count);
-
-    ScanResult {
-        total_size: total_size.load(Ordering::Relaxed),
-        file_count: file_count.load(Ordering::Relaxed),
-        dir_count: dir_count.load(Ordering::Relaxed),
-    }
-}
-
-fn scan_parallel_recursive(
-    dir: &Path,
-    total_size: &std::sync::atomic::AtomicU64,
-    file_count: &std::sync::atomic::AtomicU64,
-    dir_count: &std::sync::atomic::AtomicU64,
-) {
-    use rayon::prelude::*;
-    use std::sync::atomic::Ordering;
-
-    let entries = scan_dir(dir);
-
-    // Accumulate file stats from this directory
-    let mut local_size: u64 = 0;
-    let mut local_files: u64 = 0;
-    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
-
-    for entry in &entries {
-        if entry.is_dir {
-            subdirs.push(dir.join(&*entry.name));
-        } else {
-            local_size += entry.file_size;
-            local_files += 1;
-        }
-    }
-
-    total_size.fetch_add(local_size, Ordering::Relaxed);
-    file_count.fetch_add(local_files, Ordering::Relaxed);
-    dir_count.fetch_add(subdirs.len() as u64, Ordering::Relaxed);
-
-    // Recurse into subdirectories in parallel
-    subdirs.par_iter().for_each(|subdir| {
-        scan_parallel_recursive(subdir, total_size, file_count, dir_count);
-    });
 }

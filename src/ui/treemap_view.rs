@@ -3,7 +3,7 @@ use treemap::{MapItem, Mappable, TreemapLayout};
 
 use crate::format_size;
 use crate::model::color::{ColorMap, PALETTE_BRIGHTNESS};
-use crate::model::tree::{FileNode, FileTree};
+use crate::model::tree::{FileNode, FileTree, TreePath};
 
 /// Cushion surface coefficients: [a_x, a_y, c_x, c_y]
 /// z(x,y) = a_x*x^2 + a_y*y^2 + c_x*x + c_y*y
@@ -27,7 +27,7 @@ const BRIGHTNESS_FACTOR: f64 = 0.88 / PALETTE_BRIGHTNESS;
 pub fn show(
     ui: &mut egui::Ui,
     tree: &mut FileTree,
-    selected: &mut Option<Vec<usize>>,
+    selected: &mut Option<TreePath>,
     color_map: &ColorMap,
     cached_layout_size: &mut Option<(f32, f32)>,
     treemap_texture: &mut Option<TextureHandle>,

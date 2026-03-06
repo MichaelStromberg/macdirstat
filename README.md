@@ -8,8 +8,8 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 - **Directory tree** with collapsible nodes, keyboard navigation, and size annotations
 - **File type breakdown** showing extension statistics with color coding
 - **Fast scanning** using macOS-native `getattrlistbulk` syscall with parallel tree building via rayon
-- **Delete files/folders** directly from the UI with confirmation dialog
-- **Open any folder** via the File menu or pass a path on the command line
+- **Delete files/folders** directly from the UI — ⌘Delete for instant delete, Delete for native macOS confirmation dialog
+- **Open any folder** via the File menu, native folder picker on startup, or pass a path on the command line
 
 ## Screenshot
 

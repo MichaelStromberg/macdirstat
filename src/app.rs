@@ -5,7 +5,7 @@ use eframe::egui;
 
 use crate::format_size;
 use crate::model::color::ColorMap;
-use crate::model::tree::FileTree;
+use crate::model::tree::{FileTree, TreePath};
 use crate::ui;
 
 pub struct App {
@@ -13,7 +13,7 @@ pub struct App {
 }
 
 enum AppState {
-    Empty,
+    WaitingForPicker { frames: u8 },
     Scanning { path: PathBuf, start_time: Instant },
     Loaded(Box<LoadedState>),
 }
@@ -21,30 +21,16 @@ enum AppState {
 struct LoadedState {
     tree: FileTree,
     color_map: ColorMap,
-    selected: Option<Vec<usize>>,
+    selected: Option<TreePath>,
     scan_time_ms: f64,
     cached_layout_size: Option<(f32, f32)>,
     treemap_texture: Option<egui::TextureHandle>,
-    pending_delete: Option<PendingDelete>,
-}
-
-struct PendingDelete {
-    /// Index path to the node in the tree.
-    path: Vec<usize>,
-    /// Full filesystem path for display and deletion.
-    fs_path: PathBuf,
-    /// Display name.
-    name: String,
-    /// Size in bytes.
-    size: u64,
-    /// Whether this is a directory.
-    is_dir: bool,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
         let mut app = Self {
-            state: AppState::Empty,
+            state: AppState::WaitingForPicker { frames: 2 },
         };
         if let Some(path) = initial_path {
             app.start_scan(PathBuf::from(path));
@@ -63,12 +49,14 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Scanning is synchronous — blocks the UI thread during scan
-        if let AppState::Scanning { path, start_time } = &self.state {
-            let path = path.clone();
-            let start = *start_time;
-            let tree = FileTree::scan(&path);
+        if let AppState::Scanning {
+            ref path,
+            start_time,
+        } = self.state
+        {
+            let tree = FileTree::scan(path);
+            let scan_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
             let color_map = ColorMap::from_extensions(&tree.extensions);
-            let scan_time_ms = start.elapsed().as_secs_f64() * 1000.0;
             self.state = AppState::Loaded(Box::new(LoadedState {
                 tree,
                 color_map,
@@ -76,7 +64,6 @@ impl eframe::App for App {
                 scan_time_ms,
                 cached_layout_size: None,
                 treemap_texture: None,
-                pending_delete: None,
             }));
         }
 
@@ -84,7 +71,7 @@ impl eframe::App for App {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open Folder...").clicked() {
-                        if let Some(path) = rfd_pick_folder() {
+                        if let Some(path) = pick_folder() {
                             self.start_scan(path);
                         }
                         ui.close_menu();
@@ -104,24 +91,23 @@ impl eframe::App for App {
         });
 
         match &mut self.state {
-            AppState::Empty => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(100.0);
-                            ui.heading("MacDirStat");
-                            ui.add_space(20.0);
-                            ui.label("Select a folder to scan from the File menu,");
-                            ui.label("or drop a folder onto this window.");
-                            ui.add_space(20.0);
-                            if ui.button("Scan Home Directory").clicked()
-                                && let Ok(home) = std::env::var("HOME")
-                            {
-                                self.start_scan(PathBuf::from(home));
-                            }
-                        });
-                    });
-                });
+            AppState::WaitingForPicker { frames } => {
+                show_empty_panes(ctx);
+
+                if *frames > 0 {
+                    *frames -= 1;
+                    ctx.request_repaint();
+                } else if *frames == 0 {
+                    // Prevent re-entry after the blocking dialog returns
+                    *frames = u8::MAX;
+                    let result = pick_folder_at_home();
+                    if let Some(path) = result {
+                        self.start_scan(path);
+                    } else {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                // frames == u8::MAX: dialog was dismissed, waiting for close
             }
             AppState::Scanning { .. } => {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -138,76 +124,19 @@ impl eframe::App for App {
                     scan_time_ms,
                     cached_layout_size,
                     treemap_texture,
-                    pending_delete,
                 } = loaded.as_mut();
-                // Handle Delete key press when something is selected and no dialog open
-                if let (None, Some(sel_path)) = (&*pending_delete, selected.as_ref()) {
-                    let delete_pressed = ctx.input(|i| {
-                        i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)
-                    });
-                    if let (true, Some(fs_path), Some(node)) = (
-                        delete_pressed,
-                        tree.build_fs_path(sel_path),
-                        resolve_selected(&tree.root, sel_path),
-                    ) {
-                        *pending_delete = Some(PendingDelete {
-                            path: sel_path.clone(),
-                            fs_path,
-                            name: node.name.to_string(),
-                            size: node.size,
-                            is_dir: node.is_dir,
-                        });
-                    }
-                }
 
-                // Show delete confirmation dialog
-                let mut delete_action: Option<DeleteAction> = None;
-                if let Some(pd) = pending_delete.as_ref() {
-                    delete_action = show_delete_dialog(ctx, pd);
-                }
-                match delete_action {
-                    Some(DeleteAction::Confirm) => {
-                        let pd = pending_delete.take().unwrap();
-                        let result = if pd.is_dir {
-                            std::fs::remove_dir_all(&pd.fs_path)
-                        } else {
-                            std::fs::remove_file(&pd.fs_path)
-                        };
-                        match result {
-                            Ok(()) => {
-                                let size = pd.size;
-                                let file_count;
-                                let dir_count;
-                                if let Some(node) = resolve_selected(&tree.root, &pd.path) {
-                                    file_count = node.file_count;
-                                    dir_count = node.dir_count;
-                                } else {
-                                    file_count = 0;
-                                    dir_count = 0;
-                                }
-                                tree.subtract_from_ancestors(&pd.path, size, file_count, dir_count);
-                                tree.remove_at_path(&pd.path);
-                                tree.rebuild_extensions();
-                                *color_map = ColorMap::from_extensions(&tree.extensions);
-
-                                // Auto-select next sibling, previous sibling, or parent
-                                *selected = next_selection_after_delete(&tree.root, &pd.path);
-
-                                *cached_layout_size = None;
-                                *treemap_texture = None;
-                            }
-                            Err(e) => {
-                                eprintln!("Failed to delete {:?}: {}", pd.fs_path, e);
-                            }
-                        }
-                    }
-                    Some(DeleteAction::Cancel) => {
-                        *pending_delete = None;
-                    }
-                    None => {}
-                }
+                handle_delete(
+                    ctx,
+                    tree,
+                    color_map,
+                    selected,
+                    cached_layout_size,
+                    treemap_texture,
+                );
 
                 // Status bar
+
                 egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(format!(
@@ -251,6 +180,88 @@ impl eframe::App for App {
     }
 }
 
+/// Handle Delete/Backspace when something is selected.
+/// ⌘Delete: delete immediately (no confirmation).
+/// Delete alone: show native confirmation dialog.
+fn handle_delete(
+    ctx: &egui::Context,
+    tree: &mut FileTree,
+    color_map: &mut ColorMap,
+    selected: &mut Option<TreePath>,
+    cached_layout_size: &mut Option<(f32, f32)>,
+    treemap_texture: &mut Option<egui::TextureHandle>,
+) {
+    let Some(sel_path) = selected.as_ref() else {
+        return;
+    };
+    let (cmd_delete, bare_delete) = ctx.input(|i| {
+        let del = i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace);
+        let cmd = i.modifiers.command;
+        (del && cmd, del && !cmd)
+    });
+    if !(cmd_delete || bare_delete) {
+        return;
+    }
+    let (Some(fs_path), Some(node)) = (
+        tree.build_fs_path(sel_path),
+        resolve_selected(&tree.root, sel_path),
+    ) else {
+        return;
+    };
+
+    let name = node.name.clone();
+    let size = node.size;
+    let is_dir = node.is_dir;
+    let file_count = node.file_count;
+    let dir_count = node.dir_count;
+    let sel_path = sel_path.clone();
+
+    if !cmd_delete && !native_confirm_delete(&name, size, &fs_path, is_dir) {
+        return;
+    }
+
+    let result = if is_dir {
+        std::fs::remove_dir_all(&fs_path)
+    } else {
+        std::fs::remove_file(&fs_path)
+    };
+    match result {
+        Ok(()) => {
+            tree.subtract_from_ancestors(&sel_path, size, file_count, dir_count);
+            tree.remove_at_path(&sel_path);
+            tree.rebuild_extensions();
+            *color_map = ColorMap::from_extensions(&tree.extensions);
+            *selected = next_selection_after_delete(&tree.root, &sel_path);
+            *cached_layout_size = None;
+            *treemap_texture = None;
+        }
+        Err(e) => {
+            eprintln!("Failed to delete {:?}: {}", fs_path, e);
+        }
+    }
+}
+
+/// Render the three-pane layout with empty panels (same IDs as Loaded state).
+fn show_empty_panes(ctx: &egui::Context) {
+    egui::TopBottomPanel::bottom("status_bar").show(ctx, |_ui| {});
+
+    egui::SidePanel::right("extensions")
+        .default_width(220.0)
+        .show(ctx, |ui| {
+            ui.heading("File Types");
+            ui.separator();
+        });
+
+    egui::SidePanel::left("tree_view")
+        .default_width(350.0)
+        .show(ctx, |ui| {
+            ui.heading("Directory Tree");
+            ui.separator();
+        });
+
+    egui::CentralPanel::default().show(ctx, |_ui| {});
+}
+
 /// After deleting the node at `deleted_path`, determine what to select next:
 /// 1. Same index (next sibling shifted into place) if it exists
 /// 2. Previous sibling if deleted was last child
@@ -258,12 +269,8 @@ impl eframe::App for App {
 fn next_selection_after_delete(
     root: &crate::model::tree::FileNode,
     deleted_path: &[usize],
-) -> Option<Vec<usize>> {
-    if deleted_path.is_empty() {
-        return None;
-    }
-
-    let (&deleted_idx, parent_path) = deleted_path.split_last().unwrap();
+) -> Option<TreePath> {
+    let (&deleted_idx, parent_path) = deleted_path.split_last()?;
 
     // Navigate to the parent (after deletion)
     let parent = resolve_selected(root, parent_path)?;
@@ -300,77 +307,54 @@ fn resolve_selected<'a>(
     Some(node)
 }
 
-enum DeleteAction {
-    Confirm,
-    Cancel,
-}
+/// Show a native macOS alert for delete confirmation. Returns true if user clicked "Delete".
+fn native_confirm_delete(name: &str, size: u64, fs_path: &std::path::Path, is_dir: bool) -> bool {
+    let kind = if is_dir { "directory" } else { "file" };
+    let escaped_name = applescript_escape(name);
+    let escaped_path = applescript_escape(&fs_path.display().to_string());
+    let size_str = format_size(size);
 
-fn show_delete_dialog(ctx: &egui::Context, pd: &PendingDelete) -> Option<DeleteAction> {
-    let mut action = None;
-
-    // Consume Enter/Escape before the modal so they work even without focus
-    let enter_pressed = ctx.input(|i| i.key_pressed(egui::Key::Enter));
-    let escape_pressed = ctx.input(|i| i.key_pressed(egui::Key::Escape));
-
-    if enter_pressed {
-        return Some(DeleteAction::Confirm);
-    }
-    if escape_pressed {
-        return Some(DeleteAction::Cancel);
+    let mut message = format!("{} ({})\n{}", escaped_name, size_str, escaped_path);
+    if is_dir {
+        message.push_str("\n\nThis will permanently delete the directory and all its contents.");
     }
 
-    egui::Window::new("Confirm Delete")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(8.0);
-                let kind = if pd.is_dir { "directory" } else { "file" };
-                ui.label(format!("Delete this {}?", kind));
-                ui.add_space(4.0);
-                ui.strong(&pd.name);
-                ui.label(format_size(pd.size));
-                ui.add_space(4.0);
-                ui.label(pd.fs_path.display().to_string());
-                if pd.is_dir {
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        egui::Color32::from_rgb(200, 0, 0),
-                        "This will permanently delete the directory and all its contents.",
-                    );
-                }
-                ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    if ui.button("Delete  [Enter]").clicked() {
-                        action = Some(DeleteAction::Confirm);
-                    }
-                    if ui.button("Cancel  [Esc]").clicked() {
-                        action = Some(DeleteAction::Cancel);
-                    }
-                });
-                ui.add_space(4.0);
-            });
-        });
+    let script = format!(
+        r#"display alert "Delete this {}?" message "{}" as critical buttons {{"Cancel", "Delete"}} default button "Cancel""#,
+        kind, message,
+    );
 
-    action
-}
-
-/// Simple folder picker using a native dialog (or fallback to hardcoded path).
-fn rfd_pick_folder() -> Option<PathBuf> {
-    // eframe doesn't ship a file dialog; use a simple approach
-    // For now, use std::process::Command to invoke osascript
     let output = std::process::Command::new("osascript")
         .arg("-e")
-        .arg("POSIX path of (choose folder with prompt \"Select folder to scan\")")
-        .output()
-        .ok()?;
+        .arg(&script)
+        .output();
 
-    if output.status.success() {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
+    match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout.contains("button returned:Delete")
         }
+        _ => false,
     }
-    None
+}
+
+/// Escape a string for use inside AppleScript double-quoted strings.
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Folder picker using native NSOpenPanel.
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select folder to scan")
+        .pick_folder()
+}
+
+/// Folder picker starting at $HOME — used on startup.
+fn pick_folder_at_home() -> Option<PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
+    rfd::FileDialog::new()
+        .set_title("Select folder to scan")
+        .set_directory(&home)
+        .pick_folder()
 }

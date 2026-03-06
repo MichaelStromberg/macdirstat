@@ -5,14 +5,17 @@ use std::sync::Mutex;
 
 use crate::scan::getattrlistbulk::{self, DirEntry};
 
+/// Index path from root to a node in the tree (e.g. [2, 0, 1] = root's 3rd child → 1st child → 2nd child).
+pub type TreePath = Vec<usize>;
+
 thread_local! {
     static LOCAL_EXT_MAP: RefCell<HashMap<Box<str>, u64>> = RefCell::new(HashMap::new());
 }
 
-fn file_extension(name: &str) -> Box<str> {
+fn raw_extension(name: &str) -> &str {
     match name.rsplit_once('.') {
-        Some((_, ext)) if !ext.is_empty() => ext.into(),
-        _ => "(no ext)".into(),
+        Some((_, ext)) if !ext.is_empty() => ext,
+        _ => "",
     }
 }
 
@@ -32,14 +35,12 @@ pub struct FileNode {
 }
 
 impl FileNode {
-    /// Get the file extension (lowercase), or empty string for dirs/extensionless files.
+    /// Get the file extension, or empty string for dirs/extensionless files.
     pub fn extension(&self) -> &str {
         if self.is_dir {
-            return "";
-        }
-        match self.name.rsplit_once('.') {
-            Some((_, ext)) => ext,
-            None => "",
+            ""
+        } else {
+            raw_extension(&self.name)
         }
     }
 
@@ -74,7 +75,7 @@ impl FileTree {
         LOCAL_EXT_MAP.with(|m| {
             let local = m.replace(HashMap::new());
             if !local.is_empty() {
-                let mut global = ext_map.lock().expect("ext_map mutex poisoned");
+                let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
                 for (k, v) in local {
                     *global.entry(k).or_default() += v;
                 }
@@ -86,7 +87,7 @@ impl FileTree {
             LOCAL_EXT_MAP.with(|m| {
                 let local = m.replace(HashMap::new());
                 if !local.is_empty() {
-                    let mut global = ext_map.lock().expect("ext_map mutex poisoned");
+                    let mut global = ext_map.lock().unwrap_or_else(|e| e.into_inner());
                     for (k, v) in local {
                         *global.entry(k).or_default() += v;
                     }
@@ -96,7 +97,7 @@ impl FileTree {
 
         let mut extensions: Vec<(Box<str>, u64)> = ext_map
             .into_inner()
-            .expect("ext_map mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .into_iter()
             .collect();
         extensions.sort_unstable_by(|a, b| b.1.cmp(&a.1));
@@ -123,11 +124,7 @@ impl FileTree {
     /// Remove the node at the given index path from the tree, updating all ancestor sizes/counts.
     /// Returns the removed node, or None if the path is invalid.
     pub fn remove_at_path(&mut self, path: &[usize]) -> Option<FileNode> {
-        if path.is_empty() {
-            return None;
-        }
-
-        let (&child_idx, parent_path) = path.split_last().unwrap();
+        let (&child_idx, parent_path) = path.split_last()?;
 
         // Navigate to the parent
         let mut node = &mut self.root;
@@ -197,6 +194,12 @@ fn collect_extensions(node: &FileNode, map: &mut HashMap<Box<str>, u64>) {
 
 fn build_root_node(path: &Path) -> FileNode {
     let fd = getattrlistbulk::open_dir(path);
+    if fd < 0 {
+        eprintln!(
+            "Warning: could not open directory {:?} (permission denied or not found)",
+            path
+        );
+    }
     let name: Box<str> = path.display().to_string().into();
     let node = build_node_fd(fd, name);
     getattrlistbulk::close_dir(fd);
@@ -224,8 +227,13 @@ fn build_node_fd(parent_fd: libc::c_int, node_name: Box<str>) -> FileNode {
             total_file_count += 1;
             LOCAL_EXT_MAP.with(|m| {
                 let mut map = m.borrow_mut();
-                let ext = file_extension(&entry.name);
-                *map.entry(ext).or_default() += entry.file_size;
+                let ext = raw_extension(&entry.name);
+                let key: Box<str> = if ext.is_empty() {
+                    "(no ext)".into()
+                } else {
+                    ext.into()
+                };
+                *map.entry(key).or_default() += entry.file_size;
             });
             file_nodes.push(FileNode {
                 name: entry.name.clone(),

@@ -2,14 +2,14 @@ use egui::{Color32, Id, RichText};
 
 use crate::format_size;
 use crate::model::color::ColorMap;
-use crate::model::tree::FileNode;
+use crate::model::tree::{FileNode, TreePath};
 
 const MAX_RENDERED_ITEMS: usize = 2000;
 
 pub fn show(
     ui: &mut egui::Ui,
     root: &FileNode,
-    selected: &mut Option<Vec<usize>>,
+    selected: &mut Option<TreePath>,
     color_map: &ColorMap,
 ) {
     ui.heading("Directory Tree");
@@ -92,7 +92,7 @@ struct TreeCtx<'a> {
     color_map: &'a ColorMap,
     current_path: Vec<usize>,
     rendered: usize,
-    visible_paths: Vec<Vec<usize>>,
+    visible_paths: Vec<TreePath>,
     selection_changed: bool,
 }
 
@@ -110,7 +110,7 @@ impl<'a> TreeCtx<'a> {
 
         if node.is_dir && !node.children.is_empty() {
             let id = Id::new(("tree", self.current_path.as_slice()));
-            let default_open = depth < 1;
+            let default_open = depth < 1; // root expanded by default
 
             let state = egui::collapsing_header::CollapsingState::load_with_default_open(
                 ui.ctx(),

@@ -22,3 +22,5 @@ target
 Cargo.lock
 target/
 benches/
+CLAUDE.md
+
