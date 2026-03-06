@@ -14,13 +14,8 @@ const FADE_WIDTH: f32 = 30.0;
 const FOLDER_BODY: Color32 = Color32::from_rgb(86, 182, 249);
 const FOLDER_TAB: Color32 = Color32::from_rgb(64, 152, 226);
 
-pub fn show(
-    ui: &mut egui::Ui,
-    root: &FileNode,
-    selected: &mut Option<TreePath>,
-    _color_map: &crate::model::color::ColorMap,
-) {
-    // "MacDirStat" branding with "Dir" in blue
+/// Render the "MacDirStat" branding with "Dir" in blue.
+pub fn show_branding(ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.label(RichText::new("Mac").size(16.0).strong());
@@ -32,7 +27,16 @@ pub fn show(
         );
         ui.label(RichText::new("Stat").size(16.0).strong());
     });
-    ui.separator();
+}
+
+pub fn show(
+    ui: &mut egui::Ui,
+    root: &FileNode,
+    selected: &mut Option<TreePath>,
+    _color_map: &crate::model::color::ColorMap,
+) {
+    show_branding(ui);
+    ui.add_space(4.0);
 
     // Expand ancestors and scroll only when selection changes (not every frame,
     // otherwise the user can never manually collapse ancestor nodes).
@@ -47,8 +51,19 @@ pub fn show(
             .data_mut(|d| d.insert_temp(last_expanded_id, selected.clone()));
     }
 
-    // Derive alternating row color from the panel's background
-    let panel_fill = ui.visuals().panel_fill;
+    // Rounded-corner container for the tree (Finder/System Settings style)
+    let frame_fill = if ui.visuals().dark_mode {
+        Color32::from_rgb(38, 38, 38)
+    } else {
+        Color32::from_rgb(236, 236, 236)
+    };
+    let frame = egui::Frame::new()
+        .fill(frame_fill)
+        .corner_radius(8.0)
+        .inner_margin(4.0);
+
+    // Derive alternating row color from the frame's fill
+    let panel_fill = frame_fill;
     let alt_row_color = if ui.visuals().dark_mode {
         Color32::from_rgb(
             panel_fill.r().saturating_add(8),
@@ -68,19 +83,24 @@ pub fn show(
         current_path: Vec::new(),
         rendered: 0,
         visible_paths: Vec::new(),
-        selection_changed,
         row_index: 0,
         panel_fill,
         alt_row_color,
         scroll_right: 0.0,
+        frame_left: 0.0,
     };
 
-    egui::ScrollArea::vertical()
-        .auto_shrink([false; 2])
-        .show(ui, |ui| {
-            ctx.scroll_right = ui.clip_rect().right();
-            ctx.show_node(ui, root, 0);
-        });
+    let available_height = ui.available_height();
+    frame.show(ui, |ui| {
+        ui.set_min_height(available_height - frame.total_margin().sum().y);
+        ctx.frame_left = ui.max_rect().left();
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                ctx.scroll_right = ui.max_rect().right();
+                ctx.show_node(ui, root, 0);
+            });
+    });
 
     // Handle Up/Down arrow keys for navigation
     if !ctx.visible_paths.is_empty() {
@@ -130,11 +150,11 @@ struct TreeCtx<'a> {
     current_path: Vec<usize>,
     rendered: usize,
     visible_paths: Vec<TreePath>,
-    selection_changed: bool,
     row_index: usize,
     panel_fill: Color32,
     alt_row_color: Color32,
     scroll_right: f32,
+    frame_left: f32,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -142,15 +162,16 @@ impl<'a> TreeCtx<'a> {
     /// Paints every row (panel_fill for even, alt color for odd) to ensure
     /// a uniform background with no gaps between labels and the size column.
     /// When `is_selected`, also paints the blue selection highlight.
+    /// Constrained to the frame bounds so backgrounds don't bleed past rounded corners.
     fn paint_row_bg(&mut self, ui: &mut egui::Ui, is_selected: bool) {
         let y = ui.cursor().min.y;
-        let clip = ui.clip_rect();
         let bg = if self.row_index % 2 == 1 {
             self.alt_row_color
         } else {
             self.panel_fill
         };
-        let bg_rect = Rect::from_min_size(pos2(clip.left(), y), vec2(clip.width(), 20.0));
+        let width = self.scroll_right - self.frame_left;
+        let bg_rect = Rect::from_min_size(pos2(self.frame_left, y), vec2(width, 20.0));
         ui.painter().rect_filled(bg_rect, 0.0, bg);
         if is_selected {
             let sel_color = ui.visuals().selection.bg_fill;
@@ -294,7 +315,6 @@ impl<'a> TreeCtx<'a> {
 
             let header_row_y = y_before;
             let path_clone = self.current_path.clone();
-            let sel_changed = self.selection_changed;
             let is_sel = is_selected;
             let name_owned = display_name.to_string();
             let name_x = Cell::new(0.0f32);
@@ -314,9 +334,6 @@ impl<'a> TreeCtx<'a> {
                     let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
                     if resp.clicked() {
                         *self.selected = Some(path_clone.clone());
-                    }
-                    if is_sel && sel_changed {
-                        resp.scroll_to_me(Some(egui::Align::Center));
                     }
                 })
                 .body(|ui| {
@@ -364,9 +381,6 @@ impl<'a> TreeCtx<'a> {
                 let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
                 if resp.clicked() {
                     *self.selected = Some(self.current_path.clone());
-                }
-                if is_selected && self.selection_changed {
-                    resp.scroll_to_me(Some(egui::Align::Center));
                 }
             });
 

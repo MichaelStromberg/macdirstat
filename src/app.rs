@@ -188,6 +188,11 @@ impl eframe::App for App {
                 // Left panel: tree view
                 egui::SidePanel::left("tree_view")
                     .default_width(250.0)
+                    .show_separator_line(false)
+                    .frame(
+                        egui::Frame::side_top_panel(ctx.style().as_ref())
+                            .inner_margin(egui::Margin::from(8)),
+                    )
                     .show(ctx, |ui| {
                         ui::tree_view::show(ui, &tree.root, selected, color_map);
                     });
@@ -229,7 +234,7 @@ impl eframe::App for App {
                             }
                         }
                     });
-                    ui.separator();
+                    ui.add_space(2.0);
 
                     ui::treemap_view::show(
                         ui,
@@ -341,9 +346,12 @@ fn show_empty_panes(ctx: &egui::Context) {
 
     egui::SidePanel::left("tree_view")
         .default_width(250.0)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::side_top_panel(ctx.style().as_ref()).inner_margin(egui::Margin::from(8)),
+        )
         .show(ctx, |ui| {
-            ui.heading("MacDirStat");
-            ui.separator();
+            ui::tree_view::show_branding(ui);
         });
 
     egui::CentralPanel::default().show(ctx, |_ui| {});
