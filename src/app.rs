@@ -49,6 +49,12 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Scanning is synchronous — blocks the UI thread during scan
+        // Global blue selection highlight
+        ctx.style_mut(|style| {
+            style.visuals.selection.bg_fill = egui::Color32::from_rgb(56, 132, 244);
+        });
+
+        // Scanning is synchronous — blocks the UI thread during scan
         if let AppState::Scanning {
             ref path,
             start_time,
@@ -66,29 +72,6 @@ impl eframe::App for App {
                 treemap_texture: None,
             }));
         }
-
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Open Folder...").clicked() {
-                        if let Some(path) = pick_folder() {
-                            self.start_scan(path);
-                        }
-                        ui.close_menu();
-                    }
-                    if ui.button("Scan Home").clicked() {
-                        if let Ok(home) = std::env::var("HOME") {
-                            self.start_scan(PathBuf::from(home));
-                        }
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-            });
-        });
 
         match &mut self.state {
             AppState::WaitingForPicker { frames } => {
@@ -135,37 +118,119 @@ impl eframe::App for App {
                     treemap_texture,
                 );
 
-                // Status bar
-
+                // Status bar with selection info + action buttons
                 egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
                     ui.horizontal(|ui| {
+                        ui.label(format!("{} Files", format_file_count(tree.root.file_count)));
+                        ui.separator();
                         ui.label(format!(
-                            "{} | {} files | {} dirs | {} | Scanned in {:.0}ms",
-                            tree.root_path,
-                            tree.root.file_count,
-                            tree.root.dir_count,
+                            "{} Scanned in {:.0}ms",
                             format_size(tree.root.size),
                             scan_time_ms,
                         ));
+
+                        // Right side: action buttons
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let has_selection = selected.is_some();
+
+                            // Move to Trash button (red-tinted)
+                            let trash_text =
+                                egui::RichText::new("\u{1F5D1}").color(if has_selection {
+                                    egui::Color32::from_rgb(220, 60, 60)
+                                } else {
+                                    egui::Color32::from_rgb(160, 120, 120)
+                                });
+                            let trash_btn =
+                                ui.add_enabled(has_selection, egui::Button::new(trash_text));
+                            if trash_btn.clicked()
+                                && let Some(sel_path) = selected.as_ref()
+                                && let Some(fs_path) = tree.build_fs_path(sel_path)
+                                && let Some(node) = resolve_selected(&tree.root, sel_path)
+                            {
+                                let name = node.name.clone();
+                                let size = node.size;
+                                let is_dir = node.is_dir;
+                                let file_count = node.file_count;
+                                let dir_count = node.dir_count;
+                                let sel = sel_path.clone();
+                                if native_confirm_delete(&name, size, &fs_path, is_dir) {
+                                    execute_delete(
+                                        tree,
+                                        color_map,
+                                        selected,
+                                        &sel,
+                                        &fs_path,
+                                        is_dir,
+                                        size,
+                                        file_count,
+                                        dir_count,
+                                        cached_layout_size,
+                                        treemap_texture,
+                                    );
+                                }
+                            }
+
+                            // Reveal in Finder button
+                            let reveal_btn = ui.add_enabled(
+                                has_selection,
+                                egui::Button::new("\u{1F50D} Reveal in Finder"),
+                            );
+                            if reveal_btn.clicked()
+                                && let Some(sel_path) = selected.as_ref()
+                                && let Some(fs_path) = tree.build_fs_path(sel_path)
+                            {
+                                reveal_in_finder(&fs_path);
+                            }
+                        });
                     });
                 });
 
-                // Right panel: extension statistics
-                egui::SidePanel::right("extensions")
-                    .default_width(220.0)
-                    .show(ctx, |ui| {
-                        ui::extensions::show(ui, &tree.extensions, color_map);
-                    });
-
                 // Left panel: tree view
                 egui::SidePanel::left("tree_view")
-                    .default_width(350.0)
+                    .default_width(250.0)
                     .show(ctx, |ui| {
                         ui::tree_view::show(ui, &tree.root, selected, color_map);
                     });
 
-                // Central panel: treemap
+                // Central panel: breadcrumb + treemap
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    // Breadcrumb path bar (above treemap only)
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        let segments: Vec<&str> = tree
+                            .root_path
+                            .split('/')
+                            .filter(|s| !s.is_empty())
+                            .collect();
+
+                        ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
+                        let last_idx = segments.len().saturating_sub(1);
+                        if !segments.is_empty() {
+                            ui.label(egui::RichText::new("Macintosh HD").size(13.0));
+                            ui.label(
+                                egui::RichText::new(" \u{203A} ")
+                                    .size(13.0)
+                                    .color(egui::Color32::GRAY),
+                            );
+                        }
+                        for (i, seg) in segments.iter().enumerate() {
+                            let text = if i == last_idx {
+                                egui::RichText::new(*seg).size(13.0).strong()
+                            } else {
+                                egui::RichText::new(*seg).size(13.0)
+                            };
+                            ui.label(text);
+                            if i < last_idx {
+                                ui.label(
+                                    egui::RichText::new(" \u{203A} ")
+                                        .size(13.0)
+                                        .color(egui::Color32::GRAY),
+                                );
+                            }
+                        }
+                    });
+                    ui.separator();
+
                     ui::treemap_view::show(
                         ui,
                         tree,
@@ -220,18 +285,47 @@ fn handle_delete(
         return;
     }
 
+    execute_delete(
+        tree,
+        color_map,
+        selected,
+        &sel_path,
+        &fs_path,
+        is_dir,
+        size,
+        file_count,
+        dir_count,
+        cached_layout_size,
+        treemap_texture,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_delete(
+    tree: &mut FileTree,
+    color_map: &mut ColorMap,
+    selected: &mut Option<TreePath>,
+    sel_path: &[usize],
+    fs_path: &std::path::Path,
+    is_dir: bool,
+    size: u64,
+    file_count: u64,
+    dir_count: u64,
+    cached_layout_size: &mut Option<(f32, f32)>,
+    treemap_texture: &mut Option<egui::TextureHandle>,
+) {
     let result = if is_dir {
-        std::fs::remove_dir_all(&fs_path)
+        std::fs::remove_dir_all(fs_path)
     } else {
-        std::fs::remove_file(&fs_path)
+        std::fs::remove_file(fs_path)
     };
     match result {
         Ok(()) => {
-            tree.subtract_from_ancestors(&sel_path, size, file_count, dir_count);
-            tree.remove_at_path(&sel_path);
+            tree.subtract_from_ancestors(sel_path, size, file_count, dir_count);
+            tree.remove_at_path(sel_path);
             tree.rebuild_extensions();
             *color_map = ColorMap::from_extensions(&tree.extensions);
-            *selected = next_selection_after_delete(&tree.root, &sel_path);
+            *selected = next_selection_after_delete(&tree.root, sel_path);
             *cached_layout_size = None;
             *treemap_texture = None;
         }
@@ -245,51 +339,37 @@ fn handle_delete(
 fn show_empty_panes(ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |_ui| {});
 
-    egui::SidePanel::right("extensions")
-        .default_width(220.0)
-        .show(ctx, |ui| {
-            ui.heading("File Types");
-            ui.separator();
-        });
-
     egui::SidePanel::left("tree_view")
-        .default_width(350.0)
+        .default_width(250.0)
         .show(ctx, |ui| {
-            ui.heading("Directory Tree");
+            ui.heading("MacDirStat");
             ui.separator();
         });
 
     egui::CentralPanel::default().show(ctx, |_ui| {});
 }
 
-/// After deleting the node at `deleted_path`, determine what to select next:
-/// 1. Same index (next sibling shifted into place) if it exists
-/// 2. Previous sibling if deleted was last child
-/// 3. Parent if no siblings remain
+/// After deleting the node at `deleted_path`, determine what to select next.
 fn next_selection_after_delete(
     root: &crate::model::tree::FileNode,
     deleted_path: &[usize],
 ) -> Option<TreePath> {
     let (&deleted_idx, parent_path) = deleted_path.split_last()?;
 
-    // Navigate to the parent (after deletion)
     let parent = resolve_selected(root, parent_path)?;
     let child_count = parent.children.len();
 
     if child_count == 0 {
-        // No children left — select the parent
         if parent_path.is_empty() {
-            None // Root has no children, nothing to select
+            None
         } else {
             Some(parent_path.to_vec())
         }
     } else if deleted_idx < child_count {
-        // Next sibling shifted into this index
         let mut path = parent_path.to_vec();
         path.push(deleted_idx);
         Some(path)
     } else {
-        // Deleted was last — select previous sibling
         let mut path = parent_path.to_vec();
         path.push(child_count - 1);
         Some(path)
@@ -305,6 +385,32 @@ fn resolve_selected<'a>(
         node = node.children.get(idx)?;
     }
     Some(node)
+}
+
+fn reveal_in_finder(path: &std::path::Path) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn();
+}
+
+fn format_file_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        // Format with comma separators
+        let s = count.to_string();
+        let mut result = String::new();
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push(',');
+            }
+            result.push(c);
+        }
+        result.chars().rev().collect()
+    } else {
+        count.to_string()
+    }
 }
 
 /// Show a native macOS alert for delete confirmation. Returns true if user clicked "Delete".
@@ -341,13 +447,6 @@ fn native_confirm_delete(name: &str, size: u64, fs_path: &std::path::Path, is_di
 /// Escape a string for use inside AppleScript double-quoted strings.
 fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Folder picker using native NSOpenPanel.
-fn pick_folder() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .set_title("Select folder to scan")
-        .pick_folder()
 }
 
 /// Folder picker starting at $HOME — used on startup.

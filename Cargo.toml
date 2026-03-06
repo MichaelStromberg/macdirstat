@@ -8,6 +8,7 @@ license = "GPL-3.0"
 [dependencies]
 eframe = "0.31"
 egui = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 rayon = "1"
 rfd = "0.15"
