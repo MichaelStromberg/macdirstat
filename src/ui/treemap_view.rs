@@ -29,7 +29,7 @@ pub fn show(
     tree: &mut FileTree,
     selected: &mut Option<TreePath>,
     color_map: &ColorMap,
-    cached_layout_size: &mut Option<(f32, f32)>,
+    cached_layout_rect: &mut Option<Rect>,
     treemap_texture: &mut Option<TextureHandle>,
 ) {
     let available = ui.available_size();
@@ -43,9 +43,14 @@ pub fn show(
     let w = canvas.width();
     let h = canvas.height();
 
-    // Check if we need to re-layout and re-render the cushion texture
-    let needs_update = if let Some((cw, ch)) = *cached_layout_size {
-        (w - cw).abs() > 1.0 || (h - ch).abs() > 1.0
+    // Check if we need to re-layout and re-render the cushion texture.
+    // Compare the full canvas rect (position + size) so that side panel
+    // resizing or window moves trigger a re-layout.
+    let needs_update = if let Some(cached) = *cached_layout_rect {
+        (canvas.left() - cached.left()).abs() > 1.0
+            || (canvas.top() - cached.top()).abs() > 1.0
+            || (w - cached.width()).abs() > 1.0
+            || (h - cached.height()).abs() > 1.0
     } else {
         true
     };
@@ -54,8 +59,8 @@ pub fn show(
         let bounds = treemap::Rect::from_points(
             canvas.left() as f64,
             canvas.top() as f64,
-            canvas.right() as f64,
-            canvas.bottom() as f64,
+            w as f64,
+            h as f64,
         );
 
         // Layout the tree
@@ -84,7 +89,7 @@ pub fn show(
             *treemap_texture = Some(texture);
         }
 
-        *cached_layout_size = Some((w, h));
+        *cached_layout_rect = Some(canvas);
     }
 
     // Paint the cached texture

@@ -23,7 +23,7 @@ struct LoadedState {
     color_map: ColorMap,
     selected: Option<TreePath>,
     scan_time_ms: f64,
-    cached_layout_size: Option<(f32, f32)>,
+    cached_layout_rect: Option<egui::Rect>,
     treemap_texture: Option<egui::TextureHandle>,
 }
 
@@ -67,7 +67,7 @@ impl eframe::App for App {
                 color_map,
                 selected: None,
                 scan_time_ms,
-                cached_layout_size: None,
+                cached_layout_rect: None,
                 treemap_texture: None,
             }));
         }
@@ -218,7 +218,7 @@ impl eframe::App for App {
                         &mut loaded.tree,
                         &mut loaded.selected,
                         &loaded.color_map,
-                        &mut loaded.cached_layout_size,
+                        &mut loaded.cached_layout_rect,
                         &mut loaded.treemap_texture,
                     );
                 });
@@ -304,7 +304,7 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
             loaded.tree.rebuild_extensions();
             loaded.color_map = ColorMap::from_extensions(&loaded.tree.extensions);
             loaded.selected = next_selection_after_delete(&loaded.tree.root, &target.sel_path);
-            loaded.cached_layout_size = None;
+            loaded.cached_layout_rect = None;
             loaded.treemap_texture = None;
         }
         Err(e) => {
