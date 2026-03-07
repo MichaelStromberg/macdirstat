@@ -162,7 +162,8 @@ impl eframe::App for App {
 
                 // Left panel: tree view
                 egui::SidePanel::left("tree_view")
-                    .default_width(250.0)
+                    .default_width(300.0)
+                    .min_width(250.0)
                     .show_separator_line(false)
                     .frame(
                         egui::Frame::side_top_panel(ctx.style().as_ref())
@@ -317,7 +318,8 @@ fn show_empty_panes(ctx: &egui::Context) {
     egui::TopBottomPanel::bottom("status_bar").show(ctx, |_ui| {});
 
     egui::SidePanel::left("tree_view")
-        .default_width(250.0)
+        .default_width(300.0)
+        .min_width(250.0)
         .show_separator_line(false)
         .frame(
             egui::Frame::side_top_panel(ctx.style().as_ref()).inner_margin(egui::Margin::from(8)),
