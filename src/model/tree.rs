@@ -44,6 +44,15 @@ impl FileNode {
         }
     }
 
+    /// Walk a path of child indices to reach a descendant node.
+    pub fn resolve_path(&self, path: &[usize]) -> Option<&FileNode> {
+        let mut node = self;
+        for &idx in path {
+            node = node.children.get(idx)?;
+        }
+        Some(node)
+    }
+
     /// Remove the child at `index` from this node's children, updating size and counts.
     /// Returns the removed child.
     pub fn remove_child(&mut self, index: usize) -> FileNode {

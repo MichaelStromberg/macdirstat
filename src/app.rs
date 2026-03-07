@@ -10,6 +10,8 @@ use crate::ui;
 
 pub struct App {
     state: AppState,
+    #[cfg(target_os = "macos")]
+    about_configured: bool,
 }
 
 enum AppState {
@@ -25,12 +27,15 @@ struct LoadedState {
     scan_time_ms: f64,
     cached_layout_rect: Option<egui::Rect>,
     treemap_texture: Option<egui::TextureHandle>,
+    pending_scan: Option<PathBuf>,
 }
 
 impl App {
     pub fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
         let mut app = Self {
             state: AppState::WaitingForPicker { frames: 2 },
+            #[cfg(target_os = "macos")]
+            about_configured: false,
         };
         if let Some(path) = initial_path {
             app.start_scan(PathBuf::from(path));
@@ -53,6 +58,13 @@ impl eframe::App for App {
             style.visuals.selection.bg_fill = egui::Color32::from_rgb(56, 132, 244);
         });
 
+        // Configure the native About panel text on the first frame.
+        #[cfg(target_os = "macos")]
+        if !self.about_configured {
+            self.about_configured = true;
+            configure_about_panel_text();
+        }
+
         // Scanning is synchronous — blocks the UI thread
         if let AppState::Scanning {
             ref path,
@@ -69,6 +81,7 @@ impl eframe::App for App {
                 scan_time_ms,
                 cached_layout_rect: None,
                 treemap_texture: None,
+                pending_scan: None,
             }));
         }
 
@@ -100,130 +113,200 @@ impl eframe::App for App {
             }
             AppState::Loaded(loaded) => {
                 handle_delete(loaded, ctx);
-
-                let loaded = loaded.as_mut();
-
-                // Status bar with selection info + action buttons
-                egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "{} Files",
-                            format_file_count(loaded.tree.root.file_count)
-                        ));
-                        ui.separator();
-                        ui.label(format!(
-                            "{} Scanned in {:.0}ms",
-                            format_size(loaded.tree.root.size),
-                            loaded.scan_time_ms,
-                        ));
-
-                        // Right side: action buttons
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            let has_selection = loaded.selected.is_some();
-
-                            // Move to Trash button (red-tinted)
-                            let trash_text =
-                                egui::RichText::new("\u{1F5D1}").color(if has_selection {
-                                    egui::Color32::from_rgb(220, 60, 60)
-                                } else {
-                                    egui::Color32::from_rgb(160, 120, 120)
-                                });
-                            let trash_btn =
-                                ui.add_enabled(has_selection, egui::Button::new(trash_text));
-                            if trash_btn.clicked()
-                                && let Some(target) = loaded
-                                    .selected
-                                    .as_ref()
-                                    .and_then(|sp| DeleteTarget::from_selection(&loaded.tree, sp))
-                                && native_confirm_delete(
-                                    target.name(),
-                                    target.size,
-                                    &target.fs_path,
-                                    target.is_dir,
-                                )
-                            {
-                                execute_delete(loaded, &target);
-                            }
-
-                            // Reveal in Finder button
-                            let reveal_btn = ui.add_enabled(
-                                has_selection,
-                                egui::Button::new("\u{1F50D} Reveal in Finder"),
-                            );
-                            if reveal_btn.clicked()
-                                && let Some(sel_path) = loaded.selected.as_ref()
-                                && let Some(fs_path) = loaded.tree.build_fs_path(sel_path)
-                            {
-                                reveal_in_finder(&fs_path);
-                            }
-                        });
-                    });
-                });
-
-                // Left panel: tree view
-                egui::SidePanel::left("tree_view")
-                    .default_width(300.0)
-                    .min_width(250.0)
-                    .show_separator_line(false)
-                    .frame(
-                        egui::Frame::side_top_panel(ctx.style().as_ref())
-                            .inner_margin(egui::Margin::from(8)),
-                    )
-                    .show(ctx, |ui| {
-                        ui::tree_view::show(ui, &loaded.tree.root, &mut loaded.selected);
-                    });
-
-                // Central panel: breadcrumb + treemap
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    // Breadcrumb path bar (above treemap only)
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        let segments: Vec<&str> = loaded
-                            .tree
-                            .root_path
-                            .split('/')
-                            .filter(|s| !s.is_empty())
-                            .collect();
-
-                        ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
-                        let last_idx = segments.len().saturating_sub(1);
-                        if !segments.is_empty() {
-                            ui.label(egui::RichText::new("Macintosh HD").size(13.0));
-                            ui.label(
-                                egui::RichText::new(" \u{203A} ")
-                                    .size(13.0)
-                                    .color(egui::Color32::GRAY),
-                            );
-                        }
-                        for (i, seg) in segments.iter().enumerate() {
-                            let text = if i == last_idx {
-                                egui::RichText::new(*seg).size(13.0).strong()
-                            } else {
-                                egui::RichText::new(*seg).size(13.0)
-                            };
-                            ui.label(text);
-                            if i < last_idx {
-                                ui.label(
-                                    egui::RichText::new(" \u{203A} ")
-                                        .size(13.0)
-                                        .color(egui::Color32::GRAY),
-                                );
-                            }
-                        }
-                    });
-                    ui.add_space(2.0);
-
-                    ui::treemap_view::show(
-                        ui,
-                        &mut loaded.tree,
-                        &mut loaded.selected,
-                        &loaded.color_map,
-                        &mut loaded.cached_layout_rect,
-                        &mut loaded.treemap_texture,
-                    );
-                });
+                loaded.as_mut().show_panels(ctx);
             }
         }
+
+        // Handle ⌘O and pending scans from breadcrumb menu (outside the match
+        // to avoid borrow conflicts with self.state).
+        if let AppState::Loaded(loaded) = &mut self.state {
+            let cmd_o = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+            let path = if cmd_o {
+                pick_folder()
+            } else {
+                loaded.pending_scan.take()
+            };
+            if let Some(path) = path {
+                self.start_scan(path);
+            }
+        }
+    }
+}
+
+impl LoadedState {
+    fn show_panels(&mut self, ctx: &egui::Context) {
+        self.show_status_bar(ctx);
+        self.show_tree_panel(ctx);
+        self.show_central_panel(ctx);
+    }
+
+    fn show_status_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{} Files",
+                    format_file_count(self.tree.root.file_count)
+                ));
+                ui.separator();
+                ui.label(format!(
+                    "{} Scanned in {:.0}ms",
+                    format_size(self.tree.root.size),
+                    self.scan_time_ms,
+                ));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let has_selection = self.selected.is_some();
+
+                    let trash_text = egui::RichText::new("\u{1F5D1}").color(if has_selection {
+                        egui::Color32::from_rgb(220, 60, 60)
+                    } else {
+                        egui::Color32::from_rgb(160, 120, 120)
+                    });
+                    let trash_btn = ui.add_enabled(has_selection, egui::Button::new(trash_text));
+                    if trash_btn.clicked()
+                        && let Some(target) = self
+                            .selected
+                            .as_ref()
+                            .and_then(|sp| DeleteTarget::from_selection(&self.tree, sp))
+                        && native_confirm_delete(
+                            target.name(),
+                            target.size,
+                            &target.fs_path,
+                            target.is_dir,
+                        )
+                    {
+                        execute_delete(self, &target);
+                    }
+
+                    let reveal_btn = ui.add_enabled(
+                        has_selection,
+                        egui::Button::new("\u{1F50D} Reveal in Finder"),
+                    );
+                    if reveal_btn.clicked()
+                        && let Some(sel_path) = self.selected.as_ref()
+                        && let Some(fs_path) = self.tree.build_fs_path(sel_path)
+                    {
+                        reveal_in_finder(&fs_path);
+                    }
+                });
+            });
+        });
+    }
+
+    fn show_tree_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("tree_view")
+            .default_width(300.0)
+            .min_width(250.0)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::side_top_panel(ctx.style().as_ref())
+                    .inner_margin(egui::Margin::from(8)),
+            )
+            .show(ctx, |ui| {
+                ui::tree_view::show(ui, &self.tree.root, &mut self.selected);
+            });
+    }
+
+    fn show_central_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let mut new_scan_path: Option<PathBuf> = None;
+            self.show_breadcrumb(ui, &mut new_scan_path);
+            ui.add_space(2.0);
+            if let Some(path) = new_scan_path {
+                self.pending_scan = Some(path);
+            }
+
+            ui::treemap_view::show(
+                ui,
+                &mut self.tree,
+                &mut self.selected,
+                &self.color_map,
+                &mut self.cached_layout_rect,
+                &mut self.treemap_texture,
+            );
+        });
+    }
+
+    fn show_breadcrumb(&self, ui: &mut egui::Ui, new_scan_path: &mut Option<PathBuf>) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let segments: Vec<&str> = self
+                .tree
+                .root_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            ui.label(egui::RichText::new("\u{1F4BB}").size(13.0));
+            let last_idx = segments.len().saturating_sub(1);
+            if !segments.is_empty() {
+                ui.label(egui::RichText::new("Macintosh HD").size(13.0));
+                ui.label(
+                    egui::RichText::new(" \u{203A} ")
+                        .size(13.0)
+                        .color(egui::Color32::GRAY),
+                );
+            }
+            for (i, seg) in segments.iter().enumerate() {
+                if i == last_idx {
+                    let blue = egui::Color32::from_rgb(56, 132, 244);
+                    let text = egui::RichText::new(*seg).size(14.0).strong().color(blue);
+                    let resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+
+                    let chevron_center =
+                        egui::pos2(resp.rect.right() + 6.0, resp.rect.center().y + 1.0);
+                    let s = 3.0;
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        vec![
+                            egui::pos2(chevron_center.x - s, chevron_center.y - s),
+                            egui::pos2(chevron_center.x + s, chevron_center.y - s),
+                            egui::pos2(chevron_center.x, chevron_center.y + s),
+                        ],
+                        blue,
+                        egui::Stroke::NONE,
+                    ));
+                    ui.add_space(14.0);
+
+                    let menu_id = resp.id.with("breadcrumb_menu");
+                    if resp.clicked() {
+                        ui.memory_mut(|m| m.toggle_popup(menu_id));
+                    }
+                    egui::popup_below_widget(
+                        ui,
+                        menu_id,
+                        &resp,
+                        egui::PopupCloseBehavior::CloseOnClick,
+                        |ui| {
+                            ui.set_min_width(200.0);
+                            if ui.button("\u{1F4C2}  Open Folder\u{2026}").clicked()
+                                && let Some(path) = pick_folder()
+                            {
+                                *new_scan_path = Some(path);
+                            }
+                            if segments.len() > 1 {
+                                ui.separator();
+                                let mut path = PathBuf::from("/");
+                                for (j, ancestor) in segments[..last_idx].iter().enumerate() {
+                                    path.push(ancestor);
+                                    let indent = "  ".repeat(j);
+                                    let label = format!("{indent}\u{1F4C1}  {ancestor}");
+                                    if ui.button(&label).clicked() {
+                                        *new_scan_path = Some(path.clone());
+                                    }
+                                }
+                            }
+                        },
+                    );
+                } else {
+                    ui.label(egui::RichText::new(*seg).size(13.0));
+                    ui.label(
+                        egui::RichText::new(" \u{203A} ")
+                            .size(13.0)
+                            .color(egui::Color32::GRAY),
+                    );
+                }
+            }
+        });
     }
 }
 
@@ -241,7 +324,7 @@ impl DeleteTarget {
     /// Resolve the selected node into a DeleteTarget, or None if the path is invalid.
     fn from_selection(tree: &FileTree, sel_path: &[usize]) -> Option<Self> {
         let fs_path = tree.build_fs_path(sel_path)?;
-        let node = resolve_selected(&tree.root, sel_path)?;
+        let node = tree.root.resolve_path(sel_path)?;
         Some(Self {
             sel_path: sel_path.to_vec(),
             fs_path,
@@ -338,7 +421,7 @@ fn next_selection_after_delete(
 ) -> Option<TreePath> {
     let (&deleted_idx, parent_path) = deleted_path.split_last()?;
 
-    let parent = resolve_selected(root, parent_path)?;
+    let parent = root.resolve_path(parent_path)?;
     let child_count = parent.children.len();
 
     if child_count == 0 {
@@ -358,22 +441,14 @@ fn next_selection_after_delete(
     }
 }
 
-fn resolve_selected<'a>(
-    root: &'a crate::model::tree::FileNode,
-    path: &[usize],
-) -> Option<&'a crate::model::tree::FileNode> {
-    let mut node = root;
-    for &idx in path {
-        node = node.children.get(idx)?;
-    }
-    Some(node)
-}
-
 fn reveal_in_finder(path: &std::path::Path) {
-    let _ = std::process::Command::new("open")
+    if let Err(e) = std::process::Command::new("open")
         .arg("-R")
         .arg(path)
-        .spawn();
+        .spawn()
+    {
+        eprintln!("Failed to reveal {:?} in Finder: {}", path, e);
+    }
 }
 
 fn format_file_count(count: u64) -> String {
@@ -431,11 +506,58 @@ fn applescript_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// Set text fields in the native About panel via the app's info dictionary.
+#[cfg(target_os = "macos")]
+fn configure_about_panel_text() {
+    use crate::objc_ffi::*;
+
+    unsafe {
+        let bundle_cls = objc_getClass(c"NSBundle".as_ptr());
+        let main_bundle = send0(bundle_cls, sel_registerName(c"mainBundle".as_ptr()));
+        let info = send0(main_bundle, sel_registerName(c"infoDictionary".as_ptr()));
+        let set_sel = sel_registerName(c"setObject:forKey:".as_ptr());
+
+        send2_void(
+            info,
+            set_sel,
+            nsstring("MacDirStat"),
+            nsstring("CFBundleName"),
+        );
+
+        let version = env!("CARGO_PKG_VERSION");
+        send2_void(
+            info,
+            set_sel,
+            nsstring(version),
+            nsstring("CFBundleShortVersionString"),
+        );
+
+        send2_void(
+            info,
+            set_sel,
+            nsstring(
+                "Author: Michael Strömberg\n\
+                 \u{00A9} 2026 \u{2014} Licensed under GPL-3.0\n\n\
+                 github.com/MichaelStromberg/macdirstat\n\
+                 crates.io/crates/macdirstat",
+            ),
+            nsstring("NSHumanReadableCopyright"),
+        );
+    }
+}
+
 /// Folder picker starting at $HOME — used on startup.
 fn pick_folder_at_home() -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
     rfd::FileDialog::new()
         .set_title("Select folder to scan")
         .set_directory(&home)
+        .pick_folder()
+}
+
+/// Folder picker — used from the breadcrumb menu.
+fn pick_folder() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select folder to scan")
         .pick_folder()
 }

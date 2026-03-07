@@ -285,11 +285,7 @@ fn find_node_at(node: &FileNode, pos: egui::Pos2, path: &mut Vec<usize>) -> bool
 }
 
 fn resolve_path<'a>(root: &'a FileNode, path: &[usize]) -> Option<&'a FileNode> {
-    let mut node = root;
-    for &idx in path {
-        node = node.children.get(idx)?;
-    }
-    Some(node)
+    root.resolve_path(path)
 }
 
 fn build_path(root: &FileNode, path: &[usize]) -> String {

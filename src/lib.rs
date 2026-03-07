@@ -1,5 +1,7 @@
 pub mod app;
 pub mod model;
+#[cfg(target_os = "macos")]
+pub(crate) mod objc_ffi;
 pub mod scan;
 pub mod ui;
 
