@@ -13,7 +13,7 @@ A disk usage visualizer for macOS, inspired by [WinDirStat](https://windirstat.n
 
 ## Screenshot
 
-![MacDirStat screenshot](https://github.com/MichaelStromberg/macdirstat/blob/main/screenshot.png?raw=true)
+<img src="https://github.com/MichaelStromberg/macdirstat/blob/main/screenshot.png?raw=true" alt="MacDirStat screenshot" width="750" />
 
 ## Building
 
