@@ -96,19 +96,17 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
             });
     });
 
-    // Handle Up/Down arrow keys for navigation
+    // Handle arrow key navigation
     if !ctx.visible_paths.is_empty() {
-        let arrow = ui.ctx().input(|i| {
-            if i.key_pressed(egui::Key::ArrowDown) {
-                Some(1i32)
-            } else if i.key_pressed(egui::Key::ArrowUp) {
-                Some(-1i32)
-            } else {
-                None
-            }
-        });
+        let (up, down, left, right) = ui.ctx().input(|i| (
+            i.key_pressed(egui::Key::ArrowUp),
+            i.key_pressed(egui::Key::ArrowDown),
+            i.key_pressed(egui::Key::ArrowLeft),
+            i.key_pressed(egui::Key::ArrowRight),
+        ));
 
-        if let Some(direction) = arrow {
+        if up || down {
+            let direction = if down { 1i32 } else { -1i32 };
             let selected = &mut ctx.selected;
             if let Some(sel) = selected.as_ref() {
                 if let Some(pos) = ctx.visible_paths.iter().position(|p| p == sel) {
@@ -121,6 +119,50 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
                 }
             } else {
                 **selected = Some(ctx.visible_paths[0].clone());
+            }
+        }
+
+        if right {
+            if let Some(sel_path) = (*ctx.selected).as_ref().cloned() {
+                if let Some(node) = root.resolve_path(&sel_path) {
+                    if node.is_dir && !node.children.is_empty() {
+                        let mut first_child = sel_path.clone();
+                        first_child.push(0);
+                        if ctx.visible_paths.contains(&first_child) {
+                            *ctx.selected = Some(first_child);
+                        } else {
+                            let id = Id::new(("tree", sel_path.as_slice()));
+                            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(), id, sel_path.is_empty(),
+                            );
+                            state.set_open(true);
+                            state.store(ui.ctx());
+                        }
+                    }
+                }
+            }
+        }
+
+        if left {
+            if let Some(sel_path) = (*ctx.selected).as_ref().cloned() {
+                let is_open_dir = root.resolve_path(&sel_path)
+                    .map(|n| n.is_dir && !n.children.is_empty())
+                    .unwrap_or(false)
+                    && {
+                        let mut first_child = sel_path.clone();
+                        first_child.push(0);
+                        ctx.visible_paths.contains(&first_child)
+                    };
+                if is_open_dir {
+                    let id = Id::new(("tree", sel_path.as_slice()));
+                    let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(), id, sel_path.is_empty(),
+                    );
+                    state.set_open(false);
+                    state.store(ui.ctx());
+                } else if !sel_path.is_empty() {
+                    *ctx.selected = Some(sel_path[..sel_path.len() - 1].to_vec());
+                }
             }
         }
     }
