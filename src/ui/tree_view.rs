@@ -82,6 +82,7 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
         alt_row_color,
         scroll_right: 0.0,
         frame_left: 0.0,
+        scroll_to_selected: selection_changed,
     };
 
     let available_height = ui.available_height();
@@ -149,6 +150,7 @@ struct TreeCtx<'a> {
     alt_row_color: Color32,
     scroll_right: f32,
     frame_left: f32,
+    scroll_to_selected: bool,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -283,6 +285,10 @@ impl<'a> TreeCtx<'a> {
         } else {
             &node.name
         };
+
+        if is_selected && self.scroll_to_selected {
+            ui.scroll_to_cursor(Some(egui::Align::Center));
+        }
 
         let y_before = ui.cursor().min.y;
 
