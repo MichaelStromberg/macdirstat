@@ -74,6 +74,8 @@ impl eframe::App for App {
             let tree = FileTree::scan(path);
             let scan_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
             let color_map = ColorMap::from_extensions(&tree.extensions);
+            // cause the tree view to refresh
+            ctx.data_mut(|d| d.clear());
             self.state = AppState::Loaded(Box::new(LoadedState {
                 tree,
                 color_map,
@@ -187,6 +189,11 @@ impl LoadedState {
                         && let Some(fs_path) = self.tree.build_fs_path(sel_path)
                     {
                         reveal_in_finder(&fs_path);
+                    }
+
+                    let rescan_btn = ui.add(egui::Button::new("\u{1F504} Rescan"));
+                    if rescan_btn.clicked() {
+                        self.pending_scan = Some(PathBuf::from(&self.tree.root_path));
                     }
                 });
             });
