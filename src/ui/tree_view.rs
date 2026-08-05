@@ -9,6 +9,8 @@ const MAX_RENDERED_ITEMS: usize = 2000;
 const SIZE_COL_WIDTH: f32 = 55.0;
 const SIZE_COL_MARGIN: f32 = 8.0;
 const FADE_WIDTH: f32 = 30.0;
+/// Space a row must keep right of the name: fade region plus the size column.
+const ROW_TAIL: f32 = FADE_WIDTH + SIZE_COL_MARGIN + SIZE_COL_WIDTH;
 
 /// macOS Finder-style folder icon colors.
 const FOLDER_BODY: Color32 = Color32::from_rgb(86, 182, 249);
@@ -90,10 +92,13 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
     frame.show(ui, |ui| {
         ui.set_min_height(available_height - frame.total_margin().sum().y);
         ctx.frame_left = ui.max_rect().left();
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                ctx.scroll_right = ui.max_rect().right();
+                // Viewport right edge in screen coords. max_rect() shifts left with the
+                // horizontal scroll offset; the clip rect (viewport + margin) does not,
+                // which keeps the size column pinned while names scroll under it.
+                ctx.scroll_right = ui.clip_rect().right() - ui.visuals().clip_rect_margin;
                 ctx.show_node(ui, root, 0);
             });
     });
@@ -287,11 +292,28 @@ impl<'a> TreeCtx<'a> {
             &node.name
         };
 
+        let y_before = ui.cursor().min.y;
+
+        // Center the row vertically, and scroll horizontally so two levels of parent
+        // indentation stay visible left of it. A rect one clip-width wide centered
+        // horizontally lands its left edge exactly at the viewport's left edge.
         if is_selected && self.scroll_to_selected {
-            ui.scroll_to_cursor(Some(egui::Align::Center));
+            let clip = ui.clip_rect();
+            let left = ui.cursor().min.x - 2.0 * ui.spacing().indent;
+            let row = Rect::from_min_size(pos2(left, y_before), vec2(clip.width(), 20.0));
+            ui.scroll_to_rect(row, Some(egui::Align::Center));
         }
 
-        let y_before = ui.cursor().min.y;
+        // Width the row needs so the name is fully readable left of the size column.
+        let name_w = ui.fonts(|f| {
+            f.layout_no_wrap(
+                display_name.to_owned(),
+                egui::FontId::proportional(14.0),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+        });
 
         if node.is_dir && !node.children.is_empty() {
             let id = Id::new(("tree", self.current_path.as_slice()));
@@ -332,9 +354,12 @@ impl<'a> TreeCtx<'a> {
                     // Record x position right after the icon
                     name_x.set(icon_rect.right() + 4.0);
 
-                    // Allocate remaining width as click area
+                    // Allocate remaining width as click area, but never less than the
+                    // name needs - this is what grows the horizontal scroll range.
                     let avail = ui.available_size();
-                    let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+                    let want_right = name_x.get() + name_w + ROW_TAIL;
+                    let w = avail.x.max(want_right - ui.cursor().min.x);
+                    let (_, resp) = ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::click());
                     if resp.clicked() {
                         *self.selected = Some(path_clone.clone());
                     }
@@ -379,9 +404,12 @@ impl<'a> TreeCtx<'a> {
                     name_x.set(ui.cursor().min.x);
                 }
 
-                // Allocate remaining width as click area
+                // Allocate remaining width as click area, but never less than the
+                // name needs - this is what grows the horizontal scroll range.
                 let avail = ui.available_size();
-                let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
+                let want_right = name_x.get() + name_w + ROW_TAIL;
+                let w = avail.x.max(want_right - ui.cursor().min.x);
+                let (_, resp) = ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::click());
                 if resp.clicked() {
                     *self.selected = Some(self.current_path.clone());
                 }
