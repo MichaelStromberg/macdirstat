@@ -36,14 +36,15 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
     // Expand ancestors and scroll only when selection changes (not every frame,
     // otherwise the user can never manually collapse ancestor nodes).
     let last_expanded_id = Id::new("tree_last_expanded");
-    let last_expanded: Option<Vec<usize>> = ui.ctx().data_mut(|d| d.get_temp(last_expanded_id));
-    let selection_changed = selected.as_ref() != last_expanded.as_ref();
-    if selection_changed {
-        if let Some(sel_path) = selected.as_ref() {
-            expand_to_path(ui.ctx(), sel_path);
-        }
+    let last_expanded: Option<TreePath> = ui.ctx().data_mut(|d| d.get_temp(last_expanded_id));
+    let mut selection_changed = false;
+    if let Some(sel_path) = selected.as_ref()
+        && last_expanded.as_ref() != Some(sel_path)
+    {
+        selection_changed = true;
+        expand_to_path(ui.ctx(), sel_path);
         ui.ctx()
-            .data_mut(|d| d.insert_temp(last_expanded_id, selected.clone()));
+            .data_mut(|d| d.insert_temp(last_expanded_id, sel_path.clone()));
     }
 
     // Rounded-corner container for the tree (Finder/System Settings style)
@@ -274,7 +275,7 @@ impl<'a> TreeCtx<'a> {
         }
         self.rendered += 1;
 
-        let is_selected = self.selected.as_ref() == Some(&self.current_path);
+        let mut is_selected = self.selected.as_ref() == Some(&self.current_path);
 
         // Record this path as visible for arrow key navigation
         self.visible_paths.push(self.current_path.clone());
@@ -301,6 +302,17 @@ impl<'a> TreeCtx<'a> {
                 id,
                 default_open,
             );
+
+            // Collapsing a folder that hides the selection moves the selection up to it.
+            if !state.is_open()
+                && self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| s.len() > self.current_path.len() && s.starts_with(&self.current_path))
+            {
+                *self.selected = Some(self.current_path.clone());
+                is_selected = true;
+            }
 
             self.paint_row_bg(ui, is_selected);
 
