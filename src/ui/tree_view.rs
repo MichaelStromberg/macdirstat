@@ -165,6 +165,7 @@ impl<'a> TreeCtx<'a> {
     /// a uniform background with no gaps between labels and the size column.
     /// When `is_selected`, also paints the blue selection highlight.
     /// Constrained to the frame bounds so backgrounds don't bleed past rounded corners.
+    /// Also makes the whole row a click target for selection.
     fn paint_row_bg(&mut self, ui: &mut egui::Ui, is_selected: bool) {
         let y = ui.cursor().min.y;
         let bg = if self.row_index % 2 == 1 {
@@ -180,6 +181,13 @@ impl<'a> TreeCtx<'a> {
             ui.painter().rect_filled(bg_rect, 0.0, sel_color);
         }
         self.row_index += 1;
+
+        // Registered before the row's own widgets so the collapse triangle, which is
+        // added later and is a smaller target, still wins inside its own rect.
+        let id = Id::new(("tree_row", self.current_path.as_slice()));
+        if ui.interact(bg_rect, id, egui::Sense::click()).clicked() {
+            *self.selected = Some(self.current_path.clone());
+        }
     }
 
     /// Paint the size text at the right edge. Bold+black when selected.
@@ -339,7 +347,6 @@ impl<'a> TreeCtx<'a> {
             self.paint_row_bg(ui, is_selected);
 
             let header_row_y = y_before;
-            let path_clone = self.current_path.clone();
             let is_sel = is_selected;
             let name_owned = display_name.to_string();
             let name_x = Cell::new(0.0f32);
@@ -354,15 +361,12 @@ impl<'a> TreeCtx<'a> {
                     // Record x position right after the icon
                     name_x.set(icon_rect.right() + 4.0);
 
-                    // Allocate remaining width as click area, but never less than the
-                    // name needs - this is what grows the horizontal scroll range.
+                    // Allocate remaining width, but never less than the name needs -
+                    // this is what grows the horizontal scroll range.
                     let avail = ui.available_size();
                     let want_right = name_x.get() + name_w + ROW_TAIL;
                     let w = avail.x.max(want_right - ui.cursor().min.x);
-                    let (_, resp) = ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::click());
-                    if resp.clicked() {
-                        *self.selected = Some(path_clone.clone());
-                    }
+                    ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::hover());
                 })
                 .body(|ui| {
                     let remaining = node.children.len();
@@ -404,15 +408,12 @@ impl<'a> TreeCtx<'a> {
                     name_x.set(ui.cursor().min.x);
                 }
 
-                // Allocate remaining width as click area, but never less than the
-                // name needs - this is what grows the horizontal scroll range.
+                // Allocate remaining width, but never less than the name needs -
+                // this is what grows the horizontal scroll range.
                 let avail = ui.available_size();
                 let want_right = name_x.get() + name_w + ROW_TAIL;
                 let w = avail.x.max(want_right - ui.cursor().min.x);
-                let (_, resp) = ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::click());
-                if resp.clicked() {
-                    *self.selected = Some(self.current_path.clone());
-                }
+                ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::hover());
             });
 
             // Paint name with foreground fade and size
