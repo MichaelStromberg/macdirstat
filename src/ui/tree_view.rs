@@ -9,6 +9,8 @@ const MAX_RENDERED_ITEMS: usize = 2000;
 const SIZE_COL_WIDTH: f32 = 55.0;
 const SIZE_COL_MARGIN: f32 = 8.0;
 const FADE_WIDTH: f32 = 30.0;
+/// Space a row must keep right of the name: fade region plus the size column.
+const ROW_TAIL: f32 = FADE_WIDTH + SIZE_COL_MARGIN + SIZE_COL_WIDTH;
 
 /// macOS Finder-style folder icon colors.
 const FOLDER_BODY: Color32 = Color32::from_rgb(86, 182, 249);
@@ -36,14 +38,15 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
     // Expand ancestors and scroll only when selection changes (not every frame,
     // otherwise the user can never manually collapse ancestor nodes).
     let last_expanded_id = Id::new("tree_last_expanded");
-    let last_expanded: Option<Vec<usize>> = ui.ctx().data_mut(|d| d.get_temp(last_expanded_id));
-    let selection_changed = selected.as_ref() != last_expanded.as_ref();
-    if selection_changed {
-        if let Some(sel_path) = selected.as_ref() {
-            expand_to_path(ui.ctx(), sel_path);
-        }
+    let last_expanded: Option<TreePath> = ui.ctx().data_mut(|d| d.get_temp(last_expanded_id));
+    let mut selection_changed = false;
+    if let Some(sel_path) = selected.as_ref()
+        && last_expanded.as_ref() != Some(sel_path)
+    {
+        selection_changed = true;
+        expand_to_path(ui.ctx(), sel_path);
         ui.ctx()
-            .data_mut(|d| d.insert_temp(last_expanded_id, selected.clone()));
+            .data_mut(|d| d.insert_temp(last_expanded_id, sel_path.clone()));
     }
 
     // Rounded-corner container for the tree (Finder/System Settings style)
@@ -82,16 +85,20 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
         alt_row_color,
         scroll_right: 0.0,
         frame_left: 0.0,
+        scroll_to_selected: selection_changed,
     };
 
     let available_height = ui.available_height();
     frame.show(ui, |ui| {
         ui.set_min_height(available_height - frame.total_margin().sum().y);
         ctx.frame_left = ui.max_rect().left();
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                ctx.scroll_right = ui.max_rect().right();
+                // Viewport right edge in screen coords. max_rect() shifts left with the
+                // horizontal scroll offset; the clip rect (viewport + margin) does not,
+                // which keeps the size column pinned while names scroll under it.
+                ctx.scroll_right = ui.clip_rect().right() - ui.visuals().clip_rect_margin;
                 ctx.show_node(ui, root, 0);
             });
     });
@@ -149,6 +156,7 @@ struct TreeCtx<'a> {
     alt_row_color: Color32,
     scroll_right: f32,
     frame_left: f32,
+    scroll_to_selected: bool,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -157,6 +165,7 @@ impl<'a> TreeCtx<'a> {
     /// a uniform background with no gaps between labels and the size column.
     /// When `is_selected`, also paints the blue selection highlight.
     /// Constrained to the frame bounds so backgrounds don't bleed past rounded corners.
+    /// Also makes the whole row a click target for selection.
     fn paint_row_bg(&mut self, ui: &mut egui::Ui, is_selected: bool) {
         let y = ui.cursor().min.y;
         let bg = if self.row_index % 2 == 1 {
@@ -172,6 +181,13 @@ impl<'a> TreeCtx<'a> {
             ui.painter().rect_filled(bg_rect, 0.0, sel_color);
         }
         self.row_index += 1;
+
+        // Registered before the row's own widgets so the collapse triangle, which is
+        // added later and is a smaller target, still wins inside its own rect.
+        let id = Id::new(("tree_row", self.current_path.as_slice()));
+        if ui.interact(bg_rect, id, egui::Sense::click()).clicked() {
+            *self.selected = Some(self.current_path.clone());
+        }
     }
 
     /// Paint the size text at the right edge. Bold+black when selected.
@@ -272,7 +288,7 @@ impl<'a> TreeCtx<'a> {
         }
         self.rendered += 1;
 
-        let is_selected = self.selected.as_ref() == Some(&self.current_path);
+        let mut is_selected = self.selected.as_ref() == Some(&self.current_path);
 
         // Record this path as visible for arrow key navigation
         self.visible_paths.push(self.current_path.clone());
@@ -286,6 +302,27 @@ impl<'a> TreeCtx<'a> {
 
         let y_before = ui.cursor().min.y;
 
+        // Center the row vertically, and scroll horizontally so two levels of parent
+        // indentation stay visible left of it. A rect one clip-width wide centered
+        // horizontally lands its left edge exactly at the viewport's left edge.
+        if is_selected && self.scroll_to_selected {
+            let clip = ui.clip_rect();
+            let left = ui.cursor().min.x - 2.0 * ui.spacing().indent;
+            let row = Rect::from_min_size(pos2(left, y_before), vec2(clip.width(), 20.0));
+            ui.scroll_to_rect(row, Some(egui::Align::Center));
+        }
+
+        // Width the row needs so the name is fully readable left of the size column.
+        let name_w = ui.fonts(|f| {
+            f.layout_no_wrap(
+                display_name.to_owned(),
+                egui::FontId::proportional(14.0),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+        });
+
         if node.is_dir && !node.children.is_empty() {
             let id = Id::new(("tree", self.current_path.as_slice()));
             let default_open = depth < 1;
@@ -296,10 +333,20 @@ impl<'a> TreeCtx<'a> {
                 default_open,
             );
 
+            // Collapsing a folder that hides the selection moves the selection up to it.
+            if !state.is_open()
+                && self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|s| s.len() > self.current_path.len() && s.starts_with(&self.current_path))
+            {
+                *self.selected = Some(self.current_path.clone());
+                is_selected = true;
+            }
+
             self.paint_row_bg(ui, is_selected);
 
             let header_row_y = y_before;
-            let path_clone = self.current_path.clone();
             let is_sel = is_selected;
             let name_owned = display_name.to_string();
             let name_x = Cell::new(0.0f32);
@@ -314,12 +361,12 @@ impl<'a> TreeCtx<'a> {
                     // Record x position right after the icon
                     name_x.set(icon_rect.right() + 4.0);
 
-                    // Allocate remaining width as click area
+                    // Allocate remaining width, but never less than the name needs -
+                    // this is what grows the horizontal scroll range.
                     let avail = ui.available_size();
-                    let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
-                    if resp.clicked() {
-                        *self.selected = Some(path_clone.clone());
-                    }
+                    let want_right = name_x.get() + name_w + ROW_TAIL;
+                    let w = avail.x.max(want_right - ui.cursor().min.x);
+                    ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::hover());
                 })
                 .body(|ui| {
                     let remaining = node.children.len();
@@ -361,12 +408,12 @@ impl<'a> TreeCtx<'a> {
                     name_x.set(ui.cursor().min.x);
                 }
 
-                // Allocate remaining width as click area
+                // Allocate remaining width, but never less than the name needs -
+                // this is what grows the horizontal scroll range.
                 let avail = ui.available_size();
-                let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
-                if resp.clicked() {
-                    *self.selected = Some(self.current_path.clone());
-                }
+                let want_right = name_x.get() + name_w + ROW_TAIL;
+                let w = avail.x.max(want_right - ui.cursor().min.x);
+                ui.allocate_exact_size(vec2(w, avail.y), egui::Sense::hover());
             });
 
             // Paint name with foreground fade and size
