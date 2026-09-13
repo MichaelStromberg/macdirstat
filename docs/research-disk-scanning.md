@@ -248,7 +248,7 @@ This mirrors the `dumac` approach that achieved 521ms for 409K files:
 
 1. **Custom `getattrlistbulk` scanner** for macOS local volumes
    - FFI bindings to the syscall
-   - 128KB buffer per directory
+   - 256KB buffer per directory (as built; Apple/dumac guidance cites 128KB)
    - Rayon thread pool for parallel subdirectory processing
    - Hardlink deduplication via sharded inode HashSet
 
