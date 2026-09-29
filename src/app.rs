@@ -1,39 +1,169 @@
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant, SystemTime};
 
 use eframe::egui;
 
-use crate::format_size;
+use crate::cache::{self, CachedTree};
 use crate::model::color::ColorMap;
-use crate::model::tree::{FileTree, TreePath};
+use crate::model::tree::{FileTree, ScanProgress, TreePath};
 use crate::ui;
+use crate::{format_size, reveal_in_finder};
 
 pub struct App {
     state: AppState,
+    /// The scan currently running in the background, if any. Dropping it cancels the scan.
+    scan: Option<ActiveScan>,
+    egui_ctx: egui::Context,
     #[cfg(target_os = "macos")]
     about_configured: bool,
 }
 
 enum AppState {
-    WaitingForPicker { frames: u8 },
-    Scanning { path: PathBuf, start_time: Instant },
+    WaitingForPicker {
+        frames: u8,
+    },
+    /// Scanning with nothing to show yet (no cache) — progress comes from `App::scan`.
+    Scanning,
     Loaded(Box<LoadedState>),
+}
+
+/// Where the currently displayed tree came from.
+enum TreeSource {
+    Scanned { scan_time_ms: f64 },
+    Cached { scanned_at: SystemTime },
 }
 
 struct LoadedState {
     tree: FileTree,
     color_map: ColorMap,
     selected: Option<TreePath>,
-    scan_time_ms: f64,
+    source: TreeSource,
     cached_layout_rect: Option<egui::Rect>,
     treemap_texture: Option<egui::TextureHandle>,
     pending_scan: Option<PathBuf>,
+    /// Paths deleted since the last scan started, re-applied to its result.
+    deleted_paths: Vec<PathBuf>,
+}
+
+impl LoadedState {
+    fn new(tree: FileTree, source: TreeSource) -> Self {
+        let color_map = ColorMap::from_extensions(&tree.extensions);
+        Self {
+            tree,
+            color_map,
+            selected: None,
+            source,
+            cached_layout_rect: None,
+            treemap_texture: None,
+            pending_scan: None,
+            deleted_paths: Vec::new(),
+        }
+    }
+}
+
+enum ScanMsg {
+    Cached(CachedTree),
+    Done { tree: FileTree, scan_time_ms: f64 },
+}
+
+struct ActiveScan {
+    path: PathBuf,
+    rx: Receiver<ScanMsg>,
+    progress: Arc<ScanProgress>,
+    start: Instant,
+    /// files + dirs of a previous scan of the same folder — gives an accurate percentage.
+    expected_items: Option<u64>,
+}
+
+impl Drop for ActiveScan {
+    fn drop(&mut self) {
+        self.progress.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl ActiveScan {
+    /// Start scanning `path` on a background thread. With `load_cache`, a second
+    /// thread loads the previous result so it can be shown while scanning.
+    fn spawn(
+        path: PathBuf,
+        load_cache: bool,
+        expected_items: Option<u64>,
+        ctx: egui::Context,
+    ) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let progress = Arc::new(ScanProgress::default());
+
+        if load_cache {
+            let (tx, path, ctx) = (tx.clone(), path.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                if let Some(cached) = cache::load(&path) {
+                    let _ = tx.send(ScanMsg::Cached(cached));
+                    ctx.request_repaint();
+                }
+            });
+        }
+
+        {
+            let (progress, path) = (progress.clone(), path.clone());
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let tree = FileTree::scan_with_progress(&path, &progress);
+                if progress.is_cancelled() {
+                    return;
+                }
+                let scan_time_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let encoded = cache::encode(&tree);
+                let _ = tx.send(ScanMsg::Done { tree, scan_time_ms });
+                ctx.request_repaint();
+                if let Err(e) = cache::write(&encoded) {
+                    eprintln!("Failed to write scan cache: {e}");
+                }
+            });
+        }
+
+        Self {
+            path,
+            rx,
+            progress,
+            start: Instant::now(),
+            expected_items,
+        }
+    }
+
+    /// Estimated completion in 0.0..=0.99 (100% only once the result arrives).
+    fn fraction(&self) -> f32 {
+        let f = match self.expected_items {
+            Some(n) if n > 0 => {
+                let done = self.progress.files.load(Ordering::Relaxed)
+                    + self.progress.dirs.load(Ordering::Relaxed);
+                done as f64 / n as f64
+            }
+            _ => self.progress.work_fraction(),
+        };
+        f.clamp(0.0, 0.99) as f32
+    }
+
+    fn summary(&self) -> String {
+        let p = &self.progress;
+        format!(
+            "{} files \u{00B7} {} folders \u{00B7} {} \u{00B7} {:.1}s",
+            format_file_count(p.files.load(Ordering::Relaxed)),
+            format_file_count(p.dirs.load(Ordering::Relaxed)),
+            format_size(p.bytes.load(Ordering::Relaxed)),
+            self.start.elapsed().as_secs_f64(),
+        )
+    }
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, initial_path: Option<String>) -> Self {
         let mut app = Self {
             state: AppState::WaitingForPicker { frames: 2 },
+            scan: None,
+            egui_ctx: cc.egui_ctx.clone(),
             #[cfg(target_os = "macos")]
             about_configured: false,
         };
@@ -44,10 +174,85 @@ impl App {
     }
 
     fn start_scan(&mut self, path: PathBuf) {
-        self.state = AppState::Scanning {
-            path,
-            start_time: Instant::now(),
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // Cancel any running scan first.
+        self.scan = None;
+
+        // Re-scanning the folder already on screen: keep showing it meanwhile.
+        let expected = match &mut self.state {
+            AppState::Loaded(loaded) if Path::new(&loaded.tree.root_path) == path => {
+                loaded.deleted_paths.clear();
+                Some(loaded.tree.root.file_count + loaded.tree.root.dir_count)
+            }
+            _ => None,
         };
+        let refreshing = expected.is_some();
+        if !refreshing {
+            self.state = AppState::Scanning;
+        }
+        self.scan = Some(ActiveScan::spawn(
+            path,
+            !refreshing,
+            expected,
+            self.egui_ctx.clone(),
+        ));
+    }
+
+    /// Apply results that background threads have delivered.
+    fn poll_scan(&mut self) {
+        let Some(scan) = &mut self.scan else { return };
+        loop {
+            match scan.rx.try_recv() {
+                Ok(ScanMsg::Cached(cached)) => {
+                    if matches!(self.state, AppState::Scanning) {
+                        let root = &cached.tree.root;
+                        scan.expected_items = Some(root.file_count + root.dir_count);
+                        self.state = AppState::Loaded(Box::new(LoadedState::new(
+                            cached.tree,
+                            TreeSource::Cached {
+                                scanned_at: cached.scanned_at,
+                            },
+                        )));
+                    }
+                }
+                Ok(ScanMsg::Done { tree, scan_time_ms }) => {
+                    let mut new = LoadedState::new(tree, TreeSource::Scanned { scan_time_ms });
+                    if let AppState::Loaded(old) = &self.state
+                        && old.tree.root_path == new.tree.root_path
+                    {
+                        // Re-apply deletions made while the scan was running.
+                        let mut changed = false;
+                        for p in &old.deleted_paths {
+                            if let Some(tp) = new.tree.path_for_fs_path(p) {
+                                changed |= new.tree.remove_at_path(&tp).is_some();
+                            }
+                        }
+                        if changed {
+                            new.tree.rebuild_extensions();
+                            new.color_map = ColorMap::from_extensions(&new.tree.extensions);
+                        }
+                        // Keep the selection on the same file, if it still exists.
+                        new.selected = old
+                            .selected
+                            .as_ref()
+                            .and_then(|s| old.tree.names_for_path(s))
+                            .and_then(|names| new.tree.path_for_names(&names));
+                    }
+                    self.state = AppState::Loaded(Box::new(new));
+                    self.scan = None;
+                    return;
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    // Scan thread died without a result.
+                    self.scan = None;
+                    if matches!(self.state, AppState::Scanning) {
+                        self.state = AppState::WaitingForPicker { frames: 0 };
+                    }
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -65,26 +270,13 @@ impl eframe::App for App {
             configure_about_panel_text();
         }
 
-        // Scanning is synchronous — blocks the UI thread
-        if let AppState::Scanning {
-            ref path,
-            start_time,
-        } = self.state
-        {
-            let tree = FileTree::scan(path);
-            let scan_time_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-            let color_map = ColorMap::from_extensions(&tree.extensions);
-            self.state = AppState::Loaded(Box::new(LoadedState {
-                tree,
-                color_map,
-                selected: None,
-                scan_time_ms,
-                cached_layout_rect: None,
-                treemap_texture: None,
-                pending_scan: None,
-            }));
+        self.poll_scan();
+        if self.scan.is_some() {
+            // Keep the progress display moving.
+            ctx.request_repaint_after(Duration::from_millis(100));
         }
 
+        let mut stop_scan = false;
         match &mut self.state {
             AppState::WaitingForPicker { frames } => {
                 show_empty_panes(ctx);
@@ -104,25 +296,37 @@ impl eframe::App for App {
                 }
                 // frames == u8::MAX: dialog was dismissed, waiting for close
             }
-            AppState::Scanning { .. } => {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.heading("Scanning...");
-                    });
-                });
+            AppState::Scanning => {
+                if let Some(scan) = &self.scan {
+                    stop_scan = show_scan_progress(ctx, scan);
+                }
             }
             AppState::Loaded(loaded) => {
-                handle_delete(loaded, ctx);
-                loaded.as_mut().show_panels(ctx);
+                handle_delete(loaded, ctx, self.scan.is_some());
+                stop_scan = loaded.as_mut().show_panels(ctx, self.scan.as_ref());
             }
         }
 
-        // Handle ⌘O and pending scans from breadcrumb menu (outside the match
-        // to avoid borrow conflicts with self.state).
+        if stop_scan {
+            self.scan = None;
+            if matches!(self.state, AppState::Scanning) {
+                self.state = AppState::WaitingForPicker { frames: 0 };
+            }
+        }
+
+        // Handle ⌘O, ⌘R and pending scans from the breadcrumb menu (outside the
+        // match to avoid borrow conflicts with self.state).
         if let AppState::Loaded(loaded) = &mut self.state {
-            let cmd_o = ctx.input(|i| i.key_pressed(egui::Key::O) && i.modifiers.command);
+            let (cmd_o, cmd_r) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::O) && i.modifiers.command,
+                    i.key_pressed(egui::Key::R) && i.modifiers.command,
+                )
+            });
             let path = if cmd_o {
                 pick_folder()
+            } else if cmd_r {
+                Some(PathBuf::from(&loaded.tree.root_path))
             } else {
                 loaded.pending_scan.take()
             };
@@ -133,14 +337,56 @@ impl eframe::App for App {
     }
 }
 
+/// Full-window progress view shown while scanning a folder with no cached result.
+/// Returns true if the user clicked Cancel.
+fn show_scan_progress(ctx: &egui::Context, scan: &ActiveScan) -> bool {
+    let mut cancel = false;
+    egui::CentralPanel::default().show(ctx, |ui| {
+        let width = 420.0f32.min(ui.available_width() - 32.0);
+        ui.add_space((ui.available_height() / 2.0 - 70.0).max(0.0));
+        ui.vertical_centered(|ui| {
+            ui::tree_view::show_branding_centered(ui);
+            ui.add_space(12.0);
+            ui.label(egui::RichText::new(format!("Scanning {}", scan.path.display())).size(14.0));
+            ui.add_space(8.0);
+            let fraction = scan.fraction();
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .desired_width(width)
+                    .text(format!("{:.0}%", fraction * 100.0))
+                    .animate(true),
+            );
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new(scan.summary()).color(egui::Color32::GRAY));
+            if scan.expected_items.is_none() {
+                ui.label(
+                    egui::RichText::new(
+                        "First scan of this folder \u{2014} percentage is an estimate",
+                    )
+                    .size(11.0)
+                    .color(egui::Color32::GRAY),
+                );
+            }
+            ui.add_space(10.0);
+            if ui.button("Cancel").clicked() {
+                cancel = true;
+            }
+        });
+    });
+    cancel
+}
+
 impl LoadedState {
-    fn show_panels(&mut self, ctx: &egui::Context) {
-        self.show_status_bar(ctx);
+    /// Returns true if the user asked to stop the running scan.
+    fn show_panels(&mut self, ctx: &egui::Context, scan: Option<&ActiveScan>) -> bool {
+        let stop = self.show_status_bar(ctx, scan);
         self.show_tree_panel(ctx);
         self.show_central_panel(ctx);
+        stop
     }
 
-    fn show_status_bar(&mut self, ctx: &egui::Context) {
+    fn show_status_bar(&mut self, ctx: &egui::Context, scan: Option<&ActiveScan>) -> bool {
+        let mut stop = false;
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!(
@@ -148,11 +394,36 @@ impl LoadedState {
                     format_file_count(self.tree.root.file_count)
                 ));
                 ui.separator();
-                ui.label(format!(
-                    "{} Scanned in {:.0}ms",
-                    format_size(self.tree.root.size),
-                    self.scan_time_ms,
-                ));
+                let source = match self.source {
+                    TreeSource::Scanned { scan_time_ms } => {
+                        format!("Scanned in {}", format_duration_ms(scan_time_ms))
+                    }
+                    TreeSource::Cached { scanned_at } => {
+                        format!("Cached {}", format_age(scanned_at))
+                    }
+                };
+                ui.label(format!("{} {}", format_size(self.tree.root.size), source));
+
+                if let Some(scan) = scan {
+                    ui.separator();
+                    let fraction = scan.fraction();
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .desired_width(140.0)
+                            .text(format!("Refreshing {:.0}%", fraction * 100.0))
+                            .animate(true),
+                    )
+                    .on_hover_text(scan.summary());
+                    if ui.small_button("Stop").clicked() {
+                        stop = true;
+                    }
+                } else if ui
+                    .small_button("\u{27F3} Rescan")
+                    .on_hover_text("Rescan this folder (\u{2318}R)")
+                    .clicked()
+                {
+                    self.pending_scan = Some(PathBuf::from(&self.tree.root_path));
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let has_selection = self.selected.is_some();
@@ -175,7 +446,7 @@ impl LoadedState {
                             target.is_dir,
                         )
                     {
-                        execute_delete(self, &target);
+                        execute_delete(self, &target, scan.is_some());
                     }
 
                     let reveal_btn = ui.add_enabled(
@@ -191,6 +462,7 @@ impl LoadedState {
                 });
             });
         });
+        stop
     }
 
     fn show_tree_panel(&mut self, ctx: &egui::Context) {
@@ -316,8 +588,6 @@ struct DeleteTarget {
     fs_path: std::path::PathBuf,
     is_dir: bool,
     size: u64,
-    file_count: u64,
-    dir_count: u64,
 }
 
 impl DeleteTarget {
@@ -330,8 +600,6 @@ impl DeleteTarget {
             fs_path,
             is_dir: node.is_dir,
             size: node.size,
-            file_count: node.file_count,
-            dir_count: node.dir_count,
         })
     }
 
@@ -346,7 +614,7 @@ impl DeleteTarget {
 /// Handle Delete/Backspace when something is selected.
 /// ⌘Delete: delete immediately (no confirmation).
 /// Delete alone: show native confirmation dialog.
-fn handle_delete(loaded: &mut LoadedState, ctx: &egui::Context) {
+fn handle_delete(loaded: &mut LoadedState, ctx: &egui::Context, scanning: bool) {
     let Some(sel_path) = loaded.selected.as_ref() else {
         return;
     };
@@ -366,10 +634,10 @@ fn handle_delete(loaded: &mut LoadedState, ctx: &egui::Context) {
     {
         return;
     }
-    execute_delete(loaded, &target);
+    execute_delete(loaded, &target, scanning);
 }
 
-fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
+fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget, scanning: bool) {
     let result = if target.is_dir {
         std::fs::remove_dir_all(&target.fs_path)
     } else {
@@ -377,18 +645,22 @@ fn execute_delete(loaded: &mut LoadedState, target: &DeleteTarget) {
     };
     match result {
         Ok(()) => {
-            loaded.tree.subtract_from_ancestors(
-                &target.sel_path,
-                target.size,
-                target.file_count,
-                target.dir_count,
-            );
             loaded.tree.remove_at_path(&target.sel_path);
             loaded.tree.rebuild_extensions();
             loaded.color_map = ColorMap::from_extensions(&loaded.tree.extensions);
             loaded.selected = next_selection_after_delete(&loaded.tree.root, &target.sel_path);
             loaded.cached_layout_rect = None;
             loaded.treemap_texture = None;
+            loaded.deleted_paths.push(target.fs_path.clone());
+            // Keep the cache in sync. While a scan runs, its result is cached instead.
+            if !scanning {
+                let encoded = cache::encode(&loaded.tree);
+                std::thread::spawn(move || {
+                    if let Err(e) = cache::write(&encoded) {
+                        eprintln!("Failed to write scan cache: {e}");
+                    }
+                });
+            }
         }
         Err(e) => {
             eprintln!("Failed to delete {:?}: {}", target.fs_path, e);
@@ -441,13 +713,28 @@ fn next_selection_after_delete(
     }
 }
 
-fn reveal_in_finder(path: &std::path::Path) {
-    if let Err(e) = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .spawn()
-    {
-        eprintln!("Failed to reveal {:?} in Finder: {}", path, e);
+fn format_duration_ms(ms: f64) -> String {
+    if ms < 1000.0 {
+        format!("{ms:.0}ms")
+    } else {
+        format!("{:.1}s", ms / 1000.0)
+    }
+}
+
+/// Human-readable age of a timestamp, e.g. "5 min ago".
+fn format_age(t: SystemTime) -> String {
+    let secs = SystemTime::now()
+        .duration_since(t)
+        .unwrap_or_default()
+        .as_secs();
+    match secs {
+        0..60 => "just now".to_string(),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        _ => {
+            let days = secs / 86400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
     }
 }
 

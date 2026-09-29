@@ -2,8 +2,8 @@ use std::cell::Cell;
 
 use egui::{Color32, Id, Rect, RichText, pos2, vec2};
 
-use crate::format_size;
 use crate::model::tree::{FileNode, TreePath};
+use crate::{format_size, reveal_in_finder};
 
 const MAX_RENDERED_ITEMS: usize = 2000;
 const SIZE_COL_WIDTH: f32 = 55.0;
@@ -27,6 +27,21 @@ pub fn show_branding(ui: &mut egui::Ui) {
         );
         ui.label(RichText::new("Stat").size(16.0).strong());
     });
+}
+
+/// Branding centered horizontally (for the scan progress screen).
+pub fn show_branding_centered(ui: &mut egui::Ui) {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::FontId::proportional(22.0);
+    let fg = ui.visuals().strong_text_color();
+    for (t, c) in [
+        ("Mac", fg),
+        ("Dir", Color32::from_rgb(56, 132, 244)),
+        ("Stat", fg),
+    ] {
+        job.append(t, 0.0, egui::TextFormat::simple(font.clone(), c));
+    }
+    ui.label(job);
 }
 
 pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>) {
@@ -73,6 +88,7 @@ pub fn show(ui: &mut egui::Ui, root: &FileNode, selected: &mut Option<TreePath>)
     };
 
     let mut ctx = TreeCtx {
+        root,
         selected,
         current_path: Vec::new(),
         rendered: 0,
@@ -140,6 +156,7 @@ fn expand_to_path(ctx: &egui::Context, path: &[usize]) {
 }
 
 struct TreeCtx<'a> {
+    root: &'a FileNode,
     selected: &'a mut Option<Vec<usize>>,
     current_path: Vec<usize>,
     rendered: usize,
@@ -317,9 +334,10 @@ impl<'a> TreeCtx<'a> {
                     // Allocate remaining width as click area
                     let avail = ui.available_size();
                     let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
-                    if resp.clicked() {
+                    if resp.clicked() || resp.secondary_clicked() {
                         *self.selected = Some(path_clone.clone());
                     }
+                    row_context_menu(&resp, self.root, &path_clone);
                 })
                 .body(|ui| {
                     let remaining = node.children.len();
@@ -364,9 +382,10 @@ impl<'a> TreeCtx<'a> {
                 // Allocate remaining width as click area
                 let avail = ui.available_size();
                 let (_, resp) = ui.allocate_exact_size(avail, egui::Sense::click());
-                if resp.clicked() {
+                if resp.clicked() || resp.secondary_clicked() {
                     *self.selected = Some(self.current_path.clone());
                 }
+                row_context_menu(&resp, self.root, &self.current_path);
             });
 
             // Paint name with foreground fade and size
@@ -379,6 +398,26 @@ impl<'a> TreeCtx<'a> {
             self.paint_size(ui, y_before + 10.0, node.size, is_selected);
         }
     }
+}
+
+/// Right-click menu for a tree row.
+fn row_context_menu(resp: &egui::Response, root: &FileNode, path: &[usize]) {
+    resp.context_menu(|ui| {
+        if ui.button("\u{1F50D}  Reveal in Finder").clicked() {
+            // The root node's name is its full path.
+            let mut fs_path = std::path::PathBuf::from(&*root.name);
+            let mut node = root;
+            for &idx in path {
+                let Some(child) = node.children.get(idx) else {
+                    break;
+                };
+                fs_path.push(&*child.name);
+                node = child;
+            }
+            reveal_in_finder(&fs_path);
+            ui.close_menu();
+        }
+    });
 }
 
 /// Paint a macOS Finder-style blue folder icon into the given rect.

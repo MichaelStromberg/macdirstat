@@ -1,9 +1,9 @@
 use egui::{Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions, pos2};
 use treemap::{MapItem, Mappable, TreemapLayout};
 
-use crate::format_size;
 use crate::model::color::{ColorMap, PALETTE_BRIGHTNESS};
 use crate::model::tree::{FileNode, FileTree, TreePath};
+use crate::{format_size, reveal_in_finder};
 
 /// Cushion surface coefficients: [a_x, a_y, c_x, c_y]
 /// z(x,y) = a_x*x^2 + a_y*y^2 + c_x*x + c_y*y
@@ -77,7 +77,6 @@ pub fn show(
             color_map,
             &mut leaves,
         );
-
         // Render cushion texture
         let pw = w as usize;
         let ph = h as usize;
@@ -88,7 +87,6 @@ pub fn show(
                 .load_texture("treemap_cushion", image, TextureOptions::NEAREST);
             *treemap_texture = Some(texture);
         }
-
         *cached_layout_rect = Some(canvas);
     }
 
@@ -110,8 +108,33 @@ pub fn show(
         }
     }
 
-    // Hover tooltip
-    if let Some(pos) = response.hover_pos() {
+    // Right click: select the rectangle under the pointer and offer a context menu.
+    let menu_target_id = response.id.with("menu_target");
+    if response.secondary_clicked()
+        && let Some(pos) = response.interact_pointer_pos()
+    {
+        let mut path = Vec::new();
+        if find_node_at(&tree.root, pos, &mut path) {
+            *selected = Some(path.clone());
+            ui.ctx().data_mut(|d| d.insert_temp(menu_target_id, path));
+        }
+    }
+    response.context_menu(|ui| {
+        let target: Option<TreePath> = ui.ctx().data(|d| d.get_temp(menu_target_id));
+        let Some(fs_path) = target.and_then(|p| tree.build_fs_path(&p)) else {
+            ui.close_menu();
+            return;
+        };
+        if ui.button("\u{1F50D}  Reveal in Finder").clicked() {
+            reveal_in_finder(&fs_path);
+            ui.close_menu();
+        }
+    });
+
+    // Hover tooltip (hidden while the context menu is open)
+    if let Some(pos) = response.hover_pos()
+        && !response.context_menu_opened()
+    {
         let mut hover_path = Vec::new();
         if find_node_at(&tree.root, pos, &mut hover_path)
             && let Some(node) = resolve_path(&tree.root, &hover_path)
@@ -133,17 +156,30 @@ pub fn show(
             painter.rect_stroke(
                 r,
                 0.0,
-                egui::Stroke::new(2.0, Color32::WHITE),
+                egui::Stroke::new(2.0_f32, Color32::WHITE),
                 egui::StrokeKind::Outside,
             );
         }
     }
 }
 
+/// Below this width/height (in points) a rectangle is invisible, so its
+/// children aren't squarified — they are collapsed onto its corner instead.
+const MIN_VISIBLE: f64 = 0.5;
+
 fn layout_node(node: &mut FileNode, bounds: treemap::Rect) {
     node.rect = bounds;
 
-    if node.children.is_empty() || node.size == 0 {
+    if node.children.is_empty() {
+        return;
+    }
+    if node.size == 0 || bounds.w < MIN_VISIBLE || bounds.h < MIN_VISIBLE {
+        // Still overwrite the children's rects so hit-testing and the selection
+        // outline never use stale rects from a previous layout.
+        let corner = treemap::Rect::from_points(bounds.x, bounds.y, 0.0, 0.0);
+        for child in node.children.iter_mut() {
+            collapse_layout(child, corner);
+        }
         return;
     }
 
@@ -156,9 +192,24 @@ fn layout_node(node: &mut FileNode, bounds: treemap::Rect) {
     let layout = TreemapLayout::new();
     layout.layout_items(&mut items, bounds);
 
-    for (child, item) in node.children.iter_mut().zip(items.iter()) {
-        let b: treemap::Rect = *item.bounds();
-        layout_node(child, b);
+    // Subtrees are independent: lay out large ones in parallel.
+    if node.file_count > 20_000 {
+        use rayon::prelude::*;
+        node.children
+            .par_iter_mut()
+            .zip(items.par_iter())
+            .for_each(|(child, item)| layout_node(child, *item.bounds()));
+    } else {
+        for (child, item) in node.children.iter_mut().zip(items.iter()) {
+            layout_node(child, *item.bounds());
+        }
+    }
+}
+
+fn collapse_layout(node: &mut FileNode, rect: treemap::Rect) {
+    node.rect = rect;
+    for child in node.children.iter_mut() {
+        collapse_layout(child, rect);
     }
 }
 
@@ -183,6 +234,11 @@ fn collect_cushion_leaves(
     color_map: &ColorMap,
     leaves: &mut Vec<CushionLeaf>,
 ) {
+    // Invisible subtrees contribute no pixels.
+    if node.rect.w < MIN_VISIBLE || node.rect.h < MIN_VISIBLE {
+        return;
+    }
+
     // Add ridge for this node (skip root per WinDirStat)
     if !is_root {
         add_ridge(&mut surface, &node.rect, h);
@@ -218,7 +274,7 @@ fn render_cushion_image(pw: usize, ph: usize, canvas: Rect, leaves: &[CushionLea
 
     for leaf in leaves {
         let r = &leaf.rect;
-        if r.w < 0.5 || r.h < 0.5 {
+        if r.w < MIN_VISIBLE || r.h < MIN_VISIBLE {
             continue;
         }
 
