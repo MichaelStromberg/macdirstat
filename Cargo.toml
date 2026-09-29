@@ -10,6 +10,7 @@ eframe = "0.31"
 egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
+lz4_flex = "0.14"
 rayon = "1"
 rfd = "0.15"
 treemap = "0.3"

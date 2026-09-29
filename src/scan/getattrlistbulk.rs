@@ -24,6 +24,9 @@ const ATTR_CMN_RETURNED_ATTRS: libc::attrgroup_t = 0x8000_0000;
 const ATTR_CMN_NAME: libc::attrgroup_t = 0x0000_0001;
 const ATTR_CMN_OBJTYPE: libc::attrgroup_t = 0x0000_0008;
 
+// dirattr bits
+const ATTR_DIR_ENTRYCOUNT: libc::attrgroup_t = 0x0000_0002;
+
 // fileattr bits
 const ATTR_FILE_TOTALSIZE: libc::attrgroup_t = 0x0000_0002;
 
@@ -35,6 +38,48 @@ pub(crate) struct DirEntry {
     pub name: Box<str>,
     pub is_dir: bool,
     pub file_size: u64,
+    /// Number of immediate entries (directories only; 0 if unknown).
+    /// Used as a cheap weight for progress estimation.
+    pub entry_count: u32,
+}
+
+/// A mounted file system.
+pub(crate) struct MountPoint {
+    pub path: std::path::PathBuf,
+    /// Hidden from Finder (MNT_DONTBROWSE), e.g. system and virtual volumes.
+    pub dont_browse: bool,
+    pub local: bool,
+}
+
+/// List mounted file systems without blocking on unresponsive network mounts.
+pub(crate) fn mount_points() -> Vec<MountPoint> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    // Leave headroom in case mounts appear between the two calls.
+    let cap = count as usize + 16;
+    let mut buf: Vec<libc::statfs> = Vec::with_capacity(cap);
+    let bytes = (cap * std::mem::size_of::<libc::statfs>()) as libc::c_int;
+    let n = unsafe { libc::getfsstat(buf.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    unsafe { buf.set_len(n as usize) };
+
+    buf.iter()
+        .map(|fs| {
+            let name = unsafe { std::ffi::CStr::from_ptr(fs.f_mntonname.as_ptr()) };
+            let flags = fs.f_flags as libc::c_int;
+            MountPoint {
+                path: std::path::PathBuf::from(std::ffi::OsStr::from_bytes(name.to_bytes())),
+                dont_browse: flags & libc::MNT_DONTBROWSE != 0,
+                local: flags & libc::MNT_LOCAL != 0,
+            }
+        })
+        .collect()
 }
 
 /// Open a directory and return its fd, or -1 on error.
@@ -96,6 +141,7 @@ pub(crate) fn scan_dir_entries_fd(fd: libc::c_int) -> Vec<DirEntry> {
     let mut attrlist: libc::attrlist = unsafe { std::mem::zeroed() };
     attrlist.bitmapcount = ATTR_BIT_MAP_COUNT;
     attrlist.commonattr = ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME | ATTR_CMN_OBJTYPE;
+    attrlist.dirattr = ATTR_DIR_ENTRYCOUNT;
     attrlist.fileattr = ATTR_FILE_TOTALSIZE;
 
     let mut results = Vec::new();
@@ -168,10 +214,12 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             offset += entry_length;
             continue;
         }
+        let returned_dirattr = read_u32(buffer, pos + 8);
         let returned_fileattr = read_u32(buffer, pos + 12);
+        let entry_end = entry_start + entry_length;
 
         let name_ref_pos = pos + 20;
-        if name_ref_pos + 8 > entry_start + entry_length {
+        if name_ref_pos + 8 > entry_end {
             offset += entry_length;
             continue;
         }
@@ -185,22 +233,37 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             continue;
         };
 
-        let name: Box<str> = if name_abs < entry_start + entry_length {
-            let slice = &buffer[name_abs..entry_start + entry_length];
-            match slice.iter().position(|&b| b == 0) {
-                Some(n) => String::from_utf8_lossy(&slice[..n]).into_owned().into(),
-                None => String::from_utf8_lossy(slice).into_owned().into(),
+        let name: Box<str> = if name_abs < entry_end {
+            let slice = &buffer[name_abs..entry_end];
+            let bytes = match slice.iter().position(|&b| b == 0) {
+                Some(n) => &slice[..n],
+                None => slice,
+            };
+            // Fast path: valid UTF-8 needs a single allocation.
+            match std::str::from_utf8(bytes) {
+                Ok(s) => s.into(),
+                Err(_) => String::from_utf8_lossy(bytes).into(),
             }
         } else {
             offset += entry_length;
             continue;
         };
 
+        // Attributes are packed in order: common, dir, file — only returned ones.
         let obj_type_pos = name_ref_pos + 8;
         let obj_type = read_u32(buffer, obj_type_pos);
+        let mut attr_pos = obj_type_pos + 4;
+
+        let entry_count = if returned_dirattr & ATTR_DIR_ENTRYCOUNT != 0 {
+            let v = read_u32(buffer, attr_pos);
+            attr_pos += 4;
+            v
+        } else {
+            0
+        };
 
         let file_size = if returned_fileattr & ATTR_FILE_TOTALSIZE != 0 {
-            read_u64(buffer, obj_type_pos + 4)
+            read_u64(buffer, attr_pos)
         } else {
             0
         };
@@ -209,6 +272,7 @@ fn parse_dir_entries(buffer: &[u8], count: usize, results: &mut Vec<DirEntry>) {
             name,
             is_dir: obj_type == VDIR,
             file_size,
+            entry_count,
         });
         offset += entry_length;
     }

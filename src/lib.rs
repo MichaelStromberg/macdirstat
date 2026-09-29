@@ -1,4 +1,5 @@
 pub mod app;
+pub mod cache;
 pub mod model;
 #[cfg(target_os = "macos")]
 pub(crate) mod objc_ffi;
@@ -18,5 +19,16 @@ pub fn format_size(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+/// Show the given file or folder selected in a Finder window.
+pub fn reveal_in_finder(path: &std::path::Path) {
+    if let Err(e) = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+    {
+        eprintln!("Failed to reveal {:?} in Finder: {}", path, e);
     }
 }
