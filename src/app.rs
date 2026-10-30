@@ -112,6 +112,7 @@ impl eframe::App for App {
                 });
             }
             AppState::Loaded(loaded) => {
+                handle_copy_path(loaded, ctx);
                 handle_delete(loaded, ctx);
                 loaded.as_mut().show_panels(ctx);
             }
@@ -340,6 +341,21 @@ impl DeleteTarget {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
+    }
+}
+
+/// Handle ⌘C: copy the full path of the selected file/folder to the clipboard.
+/// egui-winit turns ⌘C into `Event::Copy` rather than a key press.
+fn handle_copy_path(loaded: &LoadedState, ctx: &egui::Context) {
+    let Some(sel_path) = loaded.selected.as_ref() else {
+        return;
+    };
+    let copy = ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+    if !copy {
+        return;
+    }
+    if let Some(fs_path) = loaded.tree.build_fs_path(sel_path) {
+        ctx.copy_text(fs_path.display().to_string());
     }
 }
 
